@@ -73,6 +73,25 @@ body{
   background:transparent;border:1px solid var(--line);border-radius:3px;padding:14px 16px;cursor:pointer}
 .alt:hover{border-color:var(--text)}
 .go:focus-visible{outline:2px solid var(--text);outline-offset:3px}
+/* game-over card: drops in from above, lands with a squash, then kicks up dust */
+.card.drop{animation:cardFall .9s both}
+@keyframes cardFall{
+  0%{transform:translateY(-120vh);animation-timing-function:cubic-bezier(.55,0,.95,.6)}
+  58%{transform:translateY(0) scale(1,1);animation-timing-function:cubic-bezier(.2,.7,.3,1)}
+  70%{transform:translateY(10px) scale(1.018,.972);animation-timing-function:ease-out}
+  84%{transform:translateY(-4px) scale(.995,1.006);animation-timing-function:ease-in-out}
+  100%{transform:translateY(0) scale(1,1)}
+}
+.dust{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:2}
+.puff{position:absolute;border-radius:50%;opacity:0;filter:blur(4px);
+  background:radial-gradient(circle,rgba(216,201,184,.62) 0%,rgba(216,201,184,.28) 45%,rgba(216,201,184,0) 72%);
+  transform:translate(-50%,-50%) scale(.3);animation:puff var(--t,1.1s) cubic-bezier(.15,.6,.3,1) forwards}
+@keyframes puff{
+  0%{opacity:0;transform:translate(-50%,-50%) scale(.3)}
+  14%{opacity:.9}
+  100%{opacity:0;transform:translate(calc(-50% + var(--dx)),calc(-50% + var(--dy))) scale(var(--s,2.6))}
+}
+@media (prefers-reduced-motion:reduce){.card.drop{animation:none}.dust{display:none}}
 .settings-panel{margin-top:20px;display:grid;gap:17px}
 .settings-panel[hidden]{display:none}
 .setting-group{display:grid;gap:8px;padding:12px 14px;background:rgba(0,0,0,.22);border:1px solid var(--line);border-radius:3px}
@@ -172,7 +191,7 @@ body{
       <dt>V</dt><dd>Switch first / third person.</dd>
       <dt>N</dt><dd>Toggle the background music. Use the music control to adjust its volume.</dd>
     </dl>
-    <button class="go" id="go" type="button">Run</button><button class="alt training-start" id="trainingBtn" type="button">Training</button><button class="alt" id="settingsBtn" type="button" hidden>Settings</button><button class="alt" id="pick" type="button">Load character</button>
+    <button class="go" id="go" type="button">Run</button><button class="alt training-start" id="trainingBtn" type="button">Training</button><button class="alt" id="settingsBtn" type="button">Settings</button><button class="alt" id="pick" type="button">Load character</button>
     <div class="training-menu-actions" id="trainingMenuActions" hidden>
       <button class="alt" id="trainingRestartBtn" type="button">Restart checkpoint</button>
       <button class="alt" id="trainingExitBtn" type="button">Exit training</button>
@@ -192,7 +211,7 @@ body{
         <div class="setting-head"><label for="settingsEffectsVolume">Sound effects volume</label><output class="setting-value" id="settingsEffectsValue">100%</output></div>
         <input class="setting-range" id="settingsEffectsVolume" type="range" min="0" max="100" step="1" value="100" aria-label="Sound effects volume">
       </div>
-      <button class="alt settings-back" id="settingsBack" type="button">Back to pause menu</button>
+      <button class="alt settings-back" id="settingsBack" type="button">Back</button>
     </div>
     <div class="note" id="ovnote">Computer controls: WASD move · Shift sprint · Space jump · C slide · Esc pause. Choose Training to practise each move.</div>
   </div>
@@ -619,8 +638,19 @@ let pads=[],ropes=[];
 const padGlow=new THREE.MeshBasicMaterial({color:0xff3a2a});
 
 function newChunk(){return{meshes:[],solids:[],pads:[],ropes:[],z1:gen.z,z0:gen.z}}
+/* the platform piece of the current lane that covers z0..z1 (used while pieces differ in width, height and sideways position) */
+function pieceAt(ch,z0,z1){
+  return ch.solids.find(sl=>sl.platform&&(gen.lane<0||sl.lane===gen.lane)&&sl.z0<=z0&&sl.z1>=z1);
+}
 function pad(ch,x,z,top){
+  const rel=x;
   x+=gen.x;
+  if(gen.vary){
+    const sp=pieceAt(ch,z-.9,z+.9);
+    if(!sp)return;
+    x=clamp((sp.x0+sp.x1)/2+rel,sp.x0+.9,sp.x1-.9);
+    top=sp.y1;
+  }
   const b=box(1.8,.14,1.8,M.steel,{tile:1});b.position.set(x,top+.07,z);addMesh(ch,b);
   const g=new THREE.Mesh(new THREE.BoxGeometry(1.4,.05,1.4),padGlow);g.position.set(x,top+.16,z);addMesh(ch,g);
   const p={x0:x-.85,x1:x+.85,z0:z-.85,z1:z+.85,y:top};ch.pads.push(p);pads.push(p);
@@ -628,9 +658,121 @@ function pad(ch,x,z,top){
 function addMesh(ch,m){worldGroup.add(m);ch.meshes.push(m);return m}
 function addSolid(ch,s){if(gen.lane>=0)s.lane=gen.lane;ch.solids.push(s);solids.push(s);if(s.wall)walls.push(s);return s}
 
+/* ---- varied ground pieces ----
+   Every piece differs from the one before it in size (width x length), in the gap in front of it, in its height and in its sideways position.
+   85% of the pieces rise (the player runs forward and climbs up), 15% drop. Steps up of up to 1.35 m are vaulted, up to 2.2 m are climbed;
+   the bigger the gap in front of a piece, the smaller the step up (so every jump stays possible). */
+const VARY={gap:2.5,len:7,w:7,x:0,area:49,preGap:0};
+function varyReset(cx){VARY.gap=rand(1.8,3.2);VARY.len=rand(5,8);VARY.w=7;VARY.x=cx||0;VARY.area=49;VARY.preGap=0}
+function diffRand(lo,hi,prev,minDiff){
+  for(let i=0;i<16;i++){const v=rand(lo,hi);if(Math.abs(v-prev)>=minDiff)return v}
+  return prev-lo>hi-prev?lo:hi;
+}
+function upLimit(g){return g<=2?2.2:g<=3?1.4:g<=4.2?.9:g<=7?.5:1.1}
+/* ---- paths that bend into each other ----
+   Per stretch one pair of neighbouring paths can bend towards each other until they overlap, then bend back to their own line.
+   The right-hand path of the pair follows the left one's height while they meet, so the two merge into one wide piece of ground. */
+let PLAN=null;
+const LH=[[],[],[]];   /* pieces placed per lane in the current stretch: {z0,z1,y,x,w} */
+function hAt(lane,z,def){
+  const L=LH[lane];if(!L||!L.length)return def;
+  let A=null,B=null;
+  for(const r of L){const zm=(r.z0+r.z1)/2;if(zm>=z)A=r;else{B=r;break}}
+  if(!A)return B.y;if(!B)return A.y;
+  const za=(A.z0+A.z1)/2,zb=(B.z0+B.z1)/2;
+  return lerp(A.y,B.y,clamp((za-z)/((za-zb)||1),0,1));
+}
+function planMerge(z0,target){
+  const P={z0,target,amp:[0,0,0],track:[-1,-1,-1],pair:-1};
+  if(gen.n>0&&Math.random()<.7){
+    const hd=[Math.abs(pathOffsets[1]-pathOffsets[0]),Math.abs(pathOffsets[2]-pathOffsets[1])];
+    let pair=hd[0]<hd[1]?0:hd[1]<hd[0]?1:(Math.random()<.5?0:1);
+    if(Math.random()<.25)pair=1-pair;
+    const a=pair,b=pair+1,D=LX[b]-LX[a],closing=Math.min(D-5,22),r=rand(.4,.6);
+    P.pair=pair;P.amp[a]=closing*r;P.amp[b]=-closing*(1-r);P.track[b]=a;
+  }
+  P.fx=(lane,z)=>{
+    const amp=P.amp[lane];if(!amp)return 0;
+    const t=clamp(((P.z0-z)/P.target-.14)/.8,0,1),sn=Math.sin(Math.PI*t);
+    return amp*sn*sn;
+  };
+  P.c=z=>{const t=clamp(((P.z0-z)/P.target-.02)/.5,0,1);return t*t*(3-2*t)};
+  return P;
+}
+function planPieces(w,len,zs,top,cx){
+  const minL=3.8,maxL=10.5;
+  let n=Math.max(2,Math.round(len/7.5)),gaps,lens;
+  const catching=PLAN&&gen.lane>=0&&PLAN.track[gen.lane]>=0&&PLAN.c(zs-len)>.02;   /* short gaps let it climb up to its neighbour quickly */
+  for(;;){
+    gaps=[0];let lg=VARY.gap;
+    for(let i=1;i<n;i++){lg=catching?diffRand(1.3,2,lg,.35):diffRand(1.3,4.2,lg,1);gaps.push(lg)}
+    const usable=len-gaps.reduce((a,g)=>a+g,0);
+    if(usable>=n*minL+.5||n<=2)break;
+    n--;
+  }
+  const usable=len-gaps.reduce((a,g)=>a+g,0);
+  for(let t=0;t<80;t++){
+    const wt=Array.from({length:n},()=>rand(.55,1.6)),sw=wt.reduce((a,v)=>a+v,0);
+    lens=wt.map(v=>usable*v/sw);
+    if(lens.every((l,i)=>l>=minL&&l<=maxL&&(i===0?Math.abs(l-VARY.len)>=1:Math.abs(l-lens[i-1])>=1.3)))break;
+  }
+  const P=lens.map((l,i)=>({gap:gaps[i],len:l}));
+  let zc=zs;
+  for(const q of P){zc-=q.gap;q.zm=zc-q.len/2;zc-=q.len}
+  const lane=gen.lane,nb=PLAN&&lane>=0?PLAN.track[lane]:-1;
+  const lo=Math.max(3.8,w*.6);
+  let y=top,prevW=VARY.w,prevArea=VARY.area,prevX=VARY.x;
+  P.forEach((q,i)=>{
+    /* height: 85% up, 15% down; the step up is limited by the gap in front of the piece */
+    const g=i===0?VARY.preGap:q.gap,hi=Math.min(upLimit(g),2.2);
+    let step;
+    if(Math.random()<.91)step=(hi>1.4&&Math.random()<.3)?rand(1.4,hi):rand(Math.min(.6,hi),Math.min(hi,1.3));
+    else step=-rand(.6,1.8);
+    if(nb>=0){   /* while the two paths meet, this one follows the neighbour's height */
+      const c=PLAN.c(q.zm),desired=lerp(y+step,hAt(nb,q.zm,y+step),c);
+      step=clamp(desired-y,-2.4,hi);
+      if(Math.abs(step)<.5)step=desired>=y?Math.min(.5,hi):-.5;
+    }
+    y+=step;q.y=y;
+    /* size: each piece differs from the last */
+    let pw=w;
+    for(let t=0;t<30;t++){
+      pw=rand(lo,w);
+      if(Math.abs(pw-prevW)>=1&&Math.abs(pw*q.len/prevArea-1)>=.15)break;
+    }
+    q.w=pw;
+    /* sideways position: small random shift + the bend towards the neighbouring path */
+    const last=i===P.length-1;
+    let x=cx+(last?0:rand(-1,1)*(w-pw)/2*.8)+(PLAN&&lane>=0?PLAN.fx(lane,q.zm):0);
+    const maxStep=(pw+prevW)/2+2.2+(i===0&&VARY.preGap>0?1.5:0);
+    x=clamp(x,prevX-maxStep,prevX+maxStep);
+    q.x=x;
+    prevX=x;prevW=pw;prevArea=pw*q.len;
+  });
+  const L=P[P.length-1];
+  VARY.w=L.w;VARY.len=L.len;VARY.gap=L.gap;VARY.x=L.x;VARY.area=L.w*L.len;VARY.preGap=0;
+  return P;
+}
 function platform(ch,xc,w,zs,len,top,continuous){
   xc+=gen.x;
   const th=2.2,minGap=1.3,maxGap=3.8,maxLen=8;
+  if(gen.vary&&!continuous&&len>=9){
+    let z1=zs;
+    const P=planPieces(w,len,zs,top,xc);
+    for(const q of P){
+      z1-=q.gap;const z0=z1-q.len,y=q.y,px=q.x;
+      const m=box(q.w,th,q.len,[M.conc,M.conc,M.top,M.concDark,M.conc,M.conc],{tile:4,topFit:6});
+      m.position.set(px,y-th/2,(z0+z1)/2);addMesh(ch,m);
+      const m2=box(q.w*.64,8,q.len*.92,M.concDark,{tile:4,noShadow:true});
+      m2.position.set(px,y-th-4,(z0+z1)/2);addMesh(ch,m2);
+      addSolid(ch,{x0:px-q.w/2,x1:px+q.w/2,y0:y-th,y1:y,z0,z1,platform:true});
+      if(gen.lane>=0&&LH[gen.lane])LH[gen.lane].push({z0,z1,y,x:px,w:q.w});
+      z1=z0;
+    }
+    const L=P[P.length-1];
+    gen.endY=L.y;gen.lastPiece={x:L.x,w:L.w,y:L.y};
+    return;
+  }
   const count=continuous?1:Math.max(1,Math.ceil((len+minGap)/(maxLen+minGap)));
   const gaps=Array.from({length:count-1},()=>rand(minGap,maxGap));
   const pieceLen=(len-gaps.reduce((sum,gap)=>sum+gap,0))/count;
@@ -651,10 +793,22 @@ function edgeGlow(ch,xc,w,z,top,cyan){
   m.position.set(xc,top+.018,z);addMesh(ch,m);
 }
 function lowWall(ch,xc,w,z,depth,h,top){
+  const rel=xc;
   xc+=gen.x;
-  const x0=xc-w/2,x1=xc+w/2,z0=z-depth/2,z1=z+depth/2;
-  const support=ch.solids.find(s=>s.platform&&s.x0<=x0&&s.x1>=x1&&s.z0<=z0&&s.z1>=z1&&Math.abs(s.y1-top)<.1);
-  if(!support)return null;
+  let x0=xc-w/2,x1=xc+w/2;const z0=z-depth/2,z1=z+depth/2;
+  let support;
+  if(gen.vary){
+    /* pieces differ in width, height and sideways position: fit the obstacle onto the piece under it */
+    support=pieceAt(ch,z0,z1);
+    if(!support)return null;
+    const half=Math.min(w,support.x1-support.x0-.3)/2;
+    if(half<.5)return null;
+    xc=clamp((support.x0+support.x1)/2+rel,support.x0+.15+half,support.x1-.15-half);
+    x0=xc-half;x1=xc+half;w=2*half;
+  }else{
+    support=ch.solids.find(sl=>sl.platform&&sl.x0<=x0&&sl.x1>=x1&&sl.z0<=z0&&sl.z1>=z1&&Math.abs(sl.y1-top)<.1);
+    if(!support)return null;
+  }
   top=support.y1;
   const m=box(w,h,depth,M.wall,{tile:2.4});
   m.position.set(xc,top+h/2,z);addMesh(ch,m);
@@ -683,7 +837,7 @@ function blk(ch,x,z,w,d,y0,y1){
   y0=support.y1;
   const h=y1-y0,m=box(w,h,d,M.wall,{tile:2.4});
   m.position.set(x,y0+h/2,z);addMesh(ch,m);
-  addSolid(ch,{x0,x1,y0,y1,z0,z1});
+  addSolid(ch,{x0,x1,y0,y1,z0,z1,tower:true});
 }
 function sideWall(ch,side,xInner,zs,len,top){
   const yb=top-9.56,h=15.06;
@@ -824,6 +978,8 @@ function transferPlots(ch,a,b,Ys,zStart,zEnd,avoidZ){
     const x=rand(left+width/2+1,right-width/2-1);
     const z=rand(zEnd+len/2+1,zStart-len/2-1);
     if(avoidZ.some(crossZ=>Math.abs(z-crossZ)<9))continue;
+    /* stay clear of path pieces that bent into this strip */
+    if(LH[a].concat(LH[b]).some(r=>Math.abs(x-r.x)<(r.w||LW)/2+width/2+1.5&&z+len/2>r.z0-1.5&&z-len/2<r.z1+1.5))continue;
     const separated=plots.every(plot=>{
       const dx=Math.max(0,Math.abs(x-plot.x)-(width+plot.width)/2);
       const dz=Math.max(0,Math.abs(z-plot.z)-(len+plot.len)/2);
@@ -833,7 +989,7 @@ function transferPlots(ch,a,b,Ys,zStart,zEnd,avoidZ){
     plots.push({x,z,width,len});
   }
   for(const plot of plots){
-    const t=(plot.x-left)/(right-left),y=lerp(Ys[a],Ys[b],t);
+    const t=(plot.x-left)/(right-left),y=lerp(hAt(a,plot.z,Ys[a]),hAt(b,plot.z,Ys[b]),t);
     gen.lane=t<.5?a:b;
     platform(ch,plot.x,plot.width,plot.z+plot.len/2,plot.len,y,true);
     edgeGlow(ch,plot.x,plot.width,plot.z+plot.len/2-.07,y,true);
@@ -844,19 +1000,24 @@ function transferPlots(ch,a,b,Ys,zStart,zEnd,avoidZ){
   gen.lane=-1;
 }
 function lanePiece(ch,kind,d){
-  const y=gen.y;
+  const y=gen.y,zS=gen.z,up=Math.random()<.85;
   if(kind==='run'){
     const len=Math.round(rand(18,26));
+    gen.vary=true;
     platform(ch,0,LW,gen.z,len,y);
     scatter(ch,LW,0,gen.z-5,gen.z-len+3,y,d,{});
-    gen.z-=len;
+    gen.vary=false;
+    gen.y=gen.endY;gen.z-=len;
   }else if(kind==='gap'){
     const len=Math.round(rand(9,13)),gap=rand(5.2,9.2)+d*.8;
+    gen.vary=true;
     platform(ch,0,LW,gen.z,len,y);
+    const ye=gen.endY,lp=gen.lastPiece;
     if(Math.random()<.7)scatter(ch,LW,0,gen.z-4,gen.z-len+5,y,d,{noBeam:true});
-    if(gap>7)pad(ch,0,gen.z-len+1.3,y);
-    edgeGlow(ch,0,LW,gen.z-len+.07,y);
-    gen.z-=len+gap;
+    if(gap>7)pad(ch,0,gen.z-len+1.3,ye);
+    gen.vary=false;
+    edgeGlow(ch,lp.x-gen.x,lp.w,gen.z-len+.07,ye);
+    gen.y=ye;gen.z-=len+gap;VARY.preGap=gap;
   }else if(kind==='launch'){
     const len=14,rl=8,rise=rand(1.8,2.6),gap=rand(6.2,8)+d*.5,zf=gen.z-len;
     platform(ch,0,LW,gen.z,len,y);
@@ -864,22 +1025,29 @@ function lanePiece(ch,kind,d){
     rampD(ch,'n',0,zf-rl/2,LW,rl,y,y+rise);
     edgeGlow(ch,0,LW,zf-rl+.07,y+rise);
     gen.z=zf-rl-gap;
+    gen.y=y+(up?rand(.5,1):-rand(.6,1.2));VARY.preGap=gap;
   }else if(kind==='wall'){
-    const w=3.6,la=8,lb=9,gap=rand(8.4,11)+d*.6,total=la+gap+lb,side=Math.random()<.5?-1:1,xb=-side*rand(0,1.6);
-    platform(ch,0,w,gen.z,la,y);platform(ch,xb,w,gen.z-la-gap,lb,y);
+    /* 40%: the wall run leads straight into a rope - no ground in between, you kick off the wall and grab the rope */
+    const toRope=Math.random()<.4;
+    const w=3.6,la=8,lb=toRope?0:9,gap=rand(8.4,11)+d*.6,total=la+gap+lb,side=Math.random()<.5?-1:1,xb=-side*rand(0,1.6);
+    const yb=toRope?y:y+(up?rand(.6,1.2):-rand(.6,1.5));
+    platform(ch,0,w,gen.z,la,y);
+    if(!toRope){platform(ch,xb,w,gen.z-la-gap,lb,yb);edgeGlow(ch,xb,w,gen.z-la-gap-.07,yb,true)}
     wallAt(ch,side,side*(w/2+.1),gen.z,total,y);
-    edgeGlow(ch,0,w,gen.z-la+.07,y,true);edgeGlow(ch,xb,w,gen.z-la-gap-.07,y,true);
-    gen.z-=total;
+    edgeGlow(ch,0,w,gen.z-la+.07,y,true);
+    gen.z-=total;gen.y=yb;VARY.preGap=0;
+    if(toRope){genRope(d,up?-.8:1.2,ch,true);VARY.preGap=0}
   }else if(kind==='steps'){
-    const l1=8,l2=Math.round(rand(9,12)),l3=8,hh=1.3;
+    const l1=8,l2=Math.round(rand(9,12)),l3=8,h1=rand(.8,1.3),h2=up?rand(.6,1.3):-rand(.6,1.2);
     platform(ch,0,LW,gen.z,l1,y);
-    platform(ch,0,LW,gen.z-l1,l2,y+hh);
-    scatter(ch,LW,0,gen.z-l1-2,gen.z-l1-l2+2,y+hh,d*.5,{noBeam:true});
-    platform(ch,0,LW,gen.z-l1-l2,l3,y);
-    gen.z-=l1+l2+l3;
+    platform(ch,0,LW,gen.z-l1,l2,y+h1);
+    scatter(ch,LW,0,gen.z-l1-2,gen.z-l1-l2+2,y+h1,d*.5,{noBeam:true});
+    platform(ch,0,LW,gen.z-l1-l2,l3,y+h1+h2);
+    gen.z-=l1+l2+l3;gen.y=y+h1+h2;VARY.preGap=0;
   }else if(kind==='rope'){
-    genRope(d,0,ch);
+    genRope(d,up?-.8:1.2,ch);VARY.preGap=0;
   }
+  if(kind!=='run'&&kind!=='gap'&&gen.lane>=0&&LH[gen.lane])LH[gen.lane].push({z1:zS,z0:gen.z,y:gen.y,x:gen.x,w:LW,sp:1});
 }
 const LANE_KINDS=[
   ['gap','gap','wall','wall','run','launch','steps'],        /* left, low path: gaps and wall runs */
@@ -964,97 +1132,141 @@ function hubRow(ch,pool,w,z,top,d){
 function hubField(ch,pool,w,zFrom,zTo,top,d){
   for(let z=zFrom;z>=zTo;z-=rand(4.1,5)-d*.7)hubRow(ch,pool,w,z,top,d);
 }
-function genHub(ch,Ys,nb,d){
-  const nextOffsets=shufflePathOffsets(),Yo=nextOffsets.map(offset=>nb+offset),nextX=shufflePathPositions();
-  const Yc=Ys[1],XO=Math.max(...LX.map(Math.abs),...nextX.map(Math.abs))+LW/2,NECK=12;
+/* ---- climbing towers (the end-of-stretch area) ----
+   After the three paths: a flat arrival deck, then two different towers you have to climb (up, then up again), then a rope swing over a wide
+   gap, then a deck that splits back into the three paths. */
+function towerSpiral(ch,d,cx,n,sh,R,bs,dir){
+  const y=gen.y,bz=gen.z,S=20,cz=bz-S/2;
+  platform(ch,cx,18,bz,S,y,true);
+  const TOP=y+sh*n;
+  for(let k=0;k<n;k++){const a=Math.PI*2*k/n;blk(ch,cx+dir*R*Math.sin(a),cz+R*Math.cos(a),bs,bs,y,y+sh*(k+1))}
+  blk(ch,cx,cz,5.8,5.8,y,TOP);
+  const gap=rand(3.4,4.6)+d*.5,lz=cz-3-gap;
+  platform(ch,cx,10,lz,9,TOP);
+  gen.z=lz-9;gen.y=TOP;
+}
+function towerZig(ch,d,cx){
+  const y=gen.y,bz=gen.z,n=5,sh=1.3,dz=4.2,S=3+n*dz+3,sd=Math.random()<.5?-1:1;
+  platform(ch,cx,18,bz,S,y,true);
+  let TOP=y,zc=bz;
+  for(let k=0;k<n;k++){
+    TOP=y+sh*(k+1);zc=bz-4.5-k*dz;
+    if(k===n-1)blk(ch,cx,zc,7,4,y,TOP);
+    else blk(ch,cx+sd*(k%2?2.6:-2.6),zc,3,3,y,TOP);
+  }
+  const gap=rand(3.4,4.6)+d*.5,lz=zc-2-gap;
+  platform(ch,cx,10,lz,9,TOP);
+  gen.z=lz-9;gen.y=TOP;
+}
+function genHub(ch,Ys,dyHub,d){
+  const nextOffsets=shufflePathOffsets(),nextX=shufflePathPositions();
+  const Yc=Ys[1],XO=Math.max(...LX.map(Math.abs),...nextX.map(Math.abs))+LW/2;
   pathOffsets=nextOffsets;
   gen.x=0;gen.lane=-1;
   let z=gen.z;
   /* 1. the outer paths ramp to the centre height */
-  const RL=26;
+  const RL=clamp(Math.max(26,4.2*Math.abs(Ys[0]-Yc),4.2*Math.abs(Ys[2]-Yc)),26,72);
   rampD(ch,'n',LX[0],z-RL/2,LW,RL,Ys[0],Yc);
   platform(ch,0,LW,z,RL,Yc);
   rampD(ch,'s',LX[2],z-RL/2,LW,RL,Yc,Ys[2]);
   z-=RL;
-  /* 2. merge deck: full width at first, then narrowing step by step into the neck */
-  const SL=5,N=6,DK=13,hw=j=>XO-(XO-NECK)*j/(N-1);
-  hubPrev='';
+  /* 2. arrival deck: all three paths meet on one flat, empty deck */
+  const DK=16;
   edgeGlow(ch,0,XO*2,z-.07,Yc,true);
   platform(ch,0,XO*2,z,DK,Yc);
-  hubField(ch,'wide',XO*2,z-4.5,z-DK+1.5,Yc,d);          /* arrival deck: obstacles start a few metres past the ramps */
   z-=DK;
-  for(let j=1;j<N;j++){platform(ch,0,hw(j)*2,z,SL,Yc);hubRow(ch,'funnel',hw(j)*2,z-SL/2,Yc,d);z-=SL}
-  /* 3. the neck: all three paths are now one */
-  const N1=17,N2=19,NG=rand(4.2,5.4)+d*.8;           /* the neck is a gauntlet with one gap in the middle */
-  platform(ch,0,NECK*2,z,N1,Yc);
-  hubField(ch,'neck',NECK*2,z-3.5,z-N1+4,Yc,d);
-  edgeGlow(ch,0,NECK*2,z-N1+.07,Yc);
-  z-=N1+NG;
-  platform(ch,0,NECK*2,z,N2,Yc);
-  hubField(ch,'neck',NECK*2,z-4,z-N2+2.5,Yc,d);
-  z-=N2;
-  /* 4. flare back out, ending in a full-width deck */
-  for(let j=N-1;j>=1;j--){platform(ch,0,hw(j)*2,z,SL,Yc);hubRow(ch,'funnel',hw(j)*2,z-SL/2,Yc,d);z-=SL}
-  const FD=DK+10;
-  platform(ch,0,XO*2,z,FD,Yc);
-  hubField(ch,'wide',XO*2,z-3.5,z-FD+6.5,Yc,d);   /* the last 6 m stay clear: time to line up with the path you want */
-  z-=FD;
-  edgeGlow(ch,0,XO*2,z+.07,Yc,true);
-  /* 5. split into three paths again, each ramping to its height for the next stretch */
-  const L2=clamp(Math.max(28,4.2*Math.max(Yc-Yo[0],Yo[2]-Yc)),28,46);
-  rampD(ch,'s',nextX[0],z-L2/2,LW,L2,Yo[0],Yc);
-  if(Math.abs(Yo[1]-Yc)<.01)platform(ch,nextX[1],LW,z,L2,Yc);
-  else rampD(ch,Yo[1]>Yc?'n':'s',nextX[1],z-L2/2,LW,L2,Math.min(Yc,Yo[1]),Math.max(Yc,Yo[1]));
-  rampD(ch,'n',nextX[2],z-L2/2,LW,L2,Yc,Yo[2]);
+  gen.z=z;gen.y=Yc;
+  /* 3. two different towers, each one higher than the last */
+  const kinds=['spiral','spiral2','zig'].sort(()=>Math.random()-.5).slice(0,2);
+  let cx=pick([-5,0,5]);
+  for(const k of kinds){
+    if(k==='spiral')towerSpiral(ch,d,cx,6,1.3,4.9,2.4,pick([-1,1]));
+    else if(k==='spiral2')towerSpiral(ch,d,cx,8,1.0,5.6,2.2,pick([-1,1]));
+    else towerZig(ch,d,cx);
+    cx=pick([-5,0,5]);
+  }
+  /* 4. rope swing over a gap too wide to jump */
+  genRope(d,1.2,ch);
+  /* 5. exit deck, then split into three paths again, each ramping to its height for the next stretch */
+  const ED=14;
+  platform(ch,0,XO*2,gen.z,ED,gen.y);
+  z=gen.z-ED;
+  const Yc2=gen.y,nb=Yc2+dyHub-nextOffsets[1],Yo=nextOffsets.map(o=>nb+o);
+  edgeGlow(ch,0,XO*2,z+.07,Yc2,true);
+  const L2=clamp(Math.max(28,4.2*Math.max(Math.abs(Yc2-Yo[0]),Math.abs(Yo[1]-Yc2),Math.abs(Yo[2]-Yc2))),28,72);
+  rampD(ch,'s',nextX[0],z-L2/2,LW,L2,Yo[0],Yc2);
+  if(Math.abs(Yo[1]-Yc2)<.01)platform(ch,nextX[1],LW,z,L2,Yc2);
+  else rampD(ch,Yo[1]>Yc2?'n':'s',nextX[1],z-L2/2,LW,L2,Math.min(Yc2,Yo[1]),Math.max(Yc2,Yo[1]));
+  rampD(ch,'n',nextX[2],z-L2/2,LW,L2,Yc2,Yo[2]);
   LX=nextX;
   z-=L2;
-  gen.z=z;
+  gen.z=z;gen.y=nb;
 }
 function genStretch(d){
   const ch=newChunk(),z0=gen.z,base=gen.y;
-  const Ys=gen.n===0?[base,base,base]:pathOffsets.map(offset=>base+offset),ends=[],target=Math.round(rand(56,76));
-  const towerLane=Math.floor(rand(0,3)),towerAt=rand(24,46);
+  const Ys=gen.n===0?[base,base,base]:pathOffsets.map(offset=>base+offset),ends=[],Ye=[],target=Math.round(rand(56,76));
+  PLAN=planMerge(z0,target);
+  for(let i=0;i<3;i++)LH[i]=[];
+  let towerLane=Math.floor(rand(0,3));
+  const towerAt=rand(24,46);
+  if(PLAN.pair>=0&&(towerLane===PLAN.pair||towerLane===PLAN.pair+1))towerLane=PLAN.pair===0?2:0;   /* the tower goes on the path that stays straight */
   for(let i=0;i<3;i++){
-    gen.x=LX[i];gen.lane=i;gen.z=z0;gen.y=Ys[i];
+    gen.x=LX[i];gen.lane=i;gen.z=z0;gen.y=Ys[i];varyReset(LX[i]);
     let last='',towerBuilt=gen.n===0;
+    const kinds=PLAN.track[i]>=0?['run']:PLAN.amp[i]?['run','run','gap']:LANE_KINDS[i];   /* a bending path only uses pieces that can follow the bend */
     while(z0-gen.z<target){
       if(i===towerLane&&!towerBuilt&&z0-gen.z>=towerAt){
-        secTower(d,ch);towerBuilt=true;last='tower';continue;
+        const zt=gen.z;secTower(d,ch);
+        LH[i].push({z1:zt,z0:gen.z,y:gen.y,x:gen.x,w:18,sp:1});VARY.preGap=0;
+        towerBuilt=true;last='tower';continue;
       }
-      let k=pick(LANE_KINDS[i]);
+      let k=pick(kinds);
       if(k===last&&k!=='run')k='run';
       lanePiece(ch,k,d);last=k;
     }
-    ends[i]=gen.z;
+    ends[i]=gen.z;Ye[i]=gen.y;
   }
   const zs=Math.min(ends[0],ends[1],ends[2]),ZX=50;
-  for(let i=0;i<3;i++){                         /* every path runs flat to the same line, then a crossing zone */
-    gen.x=LX[i];gen.lane=i;gen.y=Ys[i];
-    if(ends[i]>zs+.1)platform(ch,0,LW,ends[i],ends[i]-zs,Ys[i]);
-    platform(ch,0,LW,zs,ZX,Ys[i]);
+  /* crossing zone: pieces keep varying in size, height, gaps and sideways position and carry obstacles, except for a flat bay at the crossing itself */
+  const IS=4.2,crossingZ=[],BAY=12,bayZ=zs-21,bayY=[];
+  PLAN=null;
+  for(let i=0;i<3;i++){
+    gen.x=LX[i];gen.lane=i;gen.y=Ye[i];
+    if(ends[i]>zs+.1)platform(ch,0,LW,ends[i],ends[i]-zs,Ye[i]);
+    const zB=bayZ+BAY/2,lenA=zs-zB,zC=bayZ-BAY/2,lenC=zC-(zs-ZX);
+    varyReset(LX[i]);gen.vary=true;
+    platform(ch,0,LW,zs,lenA,Ye[i]);
+    const yA=gen.endY;
+    scatter(ch,LW,0,zs-3,zs-lenA+2,yA,d,{});
+    gen.vary=false;
+    platform(ch,0,LW,zB,BAY,yA,true);bayY[i]=yA;
+    LH[i].push({z0:zC,z1:zB,y:yA,x:LX[i],w:LW});
+    varyReset(LX[i]);gen.vary=true;
+    platform(ch,0,LW,zC,lenC,yA);
+    scatter(ch,LW,0,zC-3,zC-lenC+2,yA,d,{});
+    gen.vary=false;
+    Ye[i]=gen.endY;
   }
   gen.x=0;gen.lane=-1;
-  /* crossing courses (island half way between two paths, centred between them) */
-  const IS=4.2,crossingZ=[];
   for(let p=0;p<2;p++){
     const a=p,b=p+1,xa=LX[a]+LW/2,xb=LX[b]-LW/2,xm=(xa+xb)/2;
-    const ym=(Ys[a]+Ys[b])/2,zc=zs-21,zi=zc+rand(-2,2);
+    const ym=(bayY[a]+bayY[b])/2,zc=bayZ,zi=zc+rand(-2,2);
     crossingZ.push(zc);
-    pad(ch,xa-1.3,zc,Ys[a]);
+    pad(ch,xa-1.3,zc,bayY[a]);
     platform(ch,xm,IS,zi+IS/2,IS,ym);
     pad(ch,xm+1.2,zi,ym);
     edgeGlow(ch,xm,IS,zi+IS/2-.07,ym,true);edgeGlow(ch,xm,IS,zi-IS/2+.07,ym,true);
-    edgeGlow(ch,xa-.07,.1,zc,Ys[a],true);
+    edgeGlow(ch,xa-.07,.1,zc,bayY[a],true);
   }
   const plotStart=z0-rand(8,12),plotEnd=zs-ZX+rand(8,12);
-  transferPlots(ch,0,1,Ys,plotStart,plotEnd,crossingZ);
-  transferPlots(ch,1,2,Ys,plotStart-rand(2,5),plotEnd-rand(2,5),crossingZ);
-  /* shared height change before the next stretch */
-  let dy=pick([0,0,-1.5,-3,1.3]);
-  if(base>6)dy=pick([-3,-1.5,-3]);else if(base<-8)dy=pick([1.3,1.3,0]);
+  transferPlots(ch,0,1,Ye,plotStart,plotEnd,crossingZ);
+  transferPlots(ch,1,2,Ye,plotStart-rand(2,5),plotEnd-rand(2,5),crossingZ);
+  /* the next stretch starts higher 85% of the time (the run is a climb), lower 15% of the time */
+  const dy=Math.random()<.85?rand(1.2,3):-rand(1.2,2.4);
   gen.z=zs-ZX;
-  if(HUB_EVERY>0&&gen.n%HUB_EVERY===0)genHub(ch,Ys,base+dy,d);   /* convergence area, then back into three paths */
-  gen.y=base+dy;
+  if(HUB_EVERY>0&&gen.n%HUB_EVERY===0)genHub(ch,Ye,dy,d);   /* convergence area, then back into three paths (sets gen.y) */
+  else gen.y=Ye[1]+dy-pathOffsets[1];
+  PLAN=null;
   return ch;
 }
 /* tower: spiral of wall blocks you jump up. The ground beyond the tower is as high as the tallest block, so you have to climb it to carry on. */
@@ -1099,10 +1311,9 @@ function genPipe(d){
 }
 /* rope area: a gap far too wide to jump, one hanging rope in the middle. Jump at it, grab it, swing, let go over the far platform. */
 const ROPE_L=5.7,ROPE_OFF=3.6,ROPE_H=8.0;
-function genRope(d,drop,into){
-  const ch=into||newChunk(),X=gen.x,W=PW+1,y0=gen.y,zs=gen.z,len=10,zf=zs-len;drop=drop===undefined?1.5:drop;
-  platform(ch,0,W,zs,len,y0);
-  edgeGlow(ch,0,W,zf+.07,y0,true);
+function genRope(d,drop,into,noNear){
+  const ch=into||newChunk(),X=gen.x,W=PW+1,y0=gen.y,zs=gen.z,len=noNear?0:10,zf=zs-len;drop=drop===undefined?1.5:drop;
+  if(!noNear){platform(ch,0,W,zs,len,y0);edgeGlow(ch,0,W,zf+.07,y0,true)}
   const pz=zf-ROPE_OFF,py=y0+ROPE_H;
   /* gantry the rope hangs from: two pylons that vanish into the void and a cross beam */
   for(const sx of [-1,1]){
@@ -1148,7 +1359,7 @@ function cull(playerZ){
   }
   if(changed){
     solids=[];walls=[];pads=[];ropes=[];
-    for(const ch of chunks){for(const s of ch.solids){solids.push(s);if(s.wall)walls.push(s)}for(const p of ch.pads)pads.push(p);for(const r of ch.ropes)ropes.push(r)}
+    holeRebuildLists();
   }
 }
 function resetWorld(){
@@ -1217,7 +1428,7 @@ function blocked(x,z,feet,h){
 }
 /* Allow a tiny, physically plausible step-up instead of treating every curb edge as a hard wall. */
 function tryStepUp(x,z,hit,h){
-  if(!hit||P.state!=='ground'||P.cr||P.landT>.02||hit.wall||hit.ramp)return false;
+  if(!hit||P.state!=='ground'||P.cr||P.landT>.02||hit.wall||hit.ramp||hit.small||!hit.platform)return false;
   const top=topOf(hit,clamp(x,hit.x0,hit.x1),clamp(z,hit.z0,hit.z1));
   const rise=top-P.y;
   if(rise<-.02||rise>STEP+.13)return false;
@@ -1301,8 +1512,10 @@ function wallContact(x,y,z){
   for(let i=0;i<walls.length;i++){
     const s=walls[i];
     if(z<s.z0||z>s.z1||y<s.y0||y>s.y1)continue;
-    const dist=s.side<0?x-s.x1:s.x0-x;
-    if(dist<.8&&dist>-.25)return s;
+    /* either face of the wall can be run on: the face towards -x (wall on the player's right) or the face towards +x (wall on the left) */
+    const mid=(s.x0+s.x1)/2;
+    if(x<mid){const dl=s.x0-x;if(dl<.8&&dl>-.25)return {side:1,x0:s.x0,x1:s.x1,solid:s}}
+    else{const dr=x-s.x1;if(dr<.8&&dr>-.25)return {side:-1,x0:s.x0,x1:s.x1,solid:s}}
   }
   return null;
 }
@@ -1368,19 +1581,45 @@ const texFabric=ctex(128,128,(g,w,h)=>{
   speckle(g,w,h,900,20,210,1.6);
 });
 texFabric.repeat.set(2,2);
+/* fine textures: knit ribs for the hoodie, weave for the trousers, pores for the skin, strands for the hair */
+const texKnit=ctex(128,128,(g,w,h)=>{
+  g.fillStyle='#e6e6e6';g.fillRect(0,0,w,h);
+  for(let x=0;x<w;x+=4){g.fillStyle='rgba(0,0,0,.20)';g.fillRect(x,0,1.4,h);g.fillStyle='rgba(255,255,255,.10)';g.fillRect(x+2,0,1,h)}
+  for(let y=0;y<h;y+=6){g.fillStyle='rgba(0,0,0,.06)';g.fillRect(0,y,w,1)}
+  speckle(g,w,h,700,120,255,1.4);
+});
+texKnit.repeat.set(9,5);
+const texWeave=ctex(64,64,(g,w,h)=>{
+  g.fillStyle='#d8d8d8';g.fillRect(0,0,w,h);
+  for(let y=0;y<h;y+=2){g.fillStyle='rgba(0,0,0,.18)';g.fillRect(0,y,w,1)}
+  for(let x=0;x<w;x+=2){g.fillStyle='rgba(255,255,255,.12)';g.fillRect(x,0,1,h)}
+});
+texWeave.repeat.set(8,12);
+const texSkin=ctex(128,128,(g,w,h)=>{
+  g.fillStyle='#f4f4f4';g.fillRect(0,0,w,h);
+  for(let i=0;i<1200;i++){g.fillStyle='rgba(120,80,70,'+rand(.03,.08).toFixed(3)+')';g.beginPath();g.arc(rand(0,w),rand(0,h),rand(.5,1.5),0,7);g.fill()}
+  for(let i=0;i<500;i++){g.fillStyle='rgba(255,255,255,'+rand(.03,.08).toFixed(3)+')';g.beginPath();g.arc(rand(0,w),rand(0,h),rand(.5,1.5),0,7);g.fill()}
+});
+texSkin.repeat.set(3,3);
+const texHair=ctex(256,64,(g,w,h)=>{
+  g.fillStyle='#b8b8b8';g.fillRect(0,0,w,h);
+  for(let x=0;x<w;x+=1){const v=Math.floor(rand(90,255));g.fillStyle='rgba('+v+','+v+','+v+','+rand(.35,.9).toFixed(2)+')';g.fillRect(x,0,rand(.6,1.6),h)}
+  for(let i=0;i<40;i++){g.fillStyle='rgba(255,255,255,.35)';g.fillRect(rand(0,w),0,1,h)}
+});
 const CM={
-  skin:std({color:0xe0ac88,emissive:0x2e150d,roughness:.6,metalness:0}),
-  face:std({color:0xe0ac88,emissive:0x2e150d,roughness:.6,metalness:0}),
-  hair:std({color:0x050506,emissive:0x0d0102,roughness:.4,metalness:.1,side:THREE.DoubleSide}),
-  hood:std({color:0x4a0509,emissive:0x100203,roughness:.6}),
-  hoodDark:std({color:0x2a0306,emissive:0x0a0102,roughness:.65}),
-  pants:std({color:0x060607,emissive:0x050101,roughness:.65}),
+  skin:std({color:0xcb9674,map:texSkin,bumpMap:texSkin,bumpScale:.4,emissive:0x2e150d,roughness:.52,metalness:0}),
+  face:std({color:0xffffff,map:faceTexture(),emissive:0x2e150d,roughness:.5,metalness:0}),
+  hair:std({color:0x2a1d17,map:texHair,bumpMap:texHair,bumpScale:.8,emissive:0x0d0605,roughness:.32,metalness:.15,side:THREE.DoubleSide}),
+  hood:new THREE.MeshPhysicalMaterial({color:0x7a0d14,emissive:0x1a0305,roughness:.82,sheen:1,sheenRoughness:.6,sheenColor:new THREE.Color(0xb04a52)}),
+  hoodDark:new THREE.MeshPhysicalMaterial({color:0x3e060a,emissive:0x0a0102,roughness:.85,sheen:.8,sheenRoughness:.7,sheenColor:new THREE.Color(0x8a3038)}),
+  pants:std({color:0x15161a,map:texWeave,bumpMap:texWeave,bumpScale:.6,emissive:0x050101,roughness:.78}),
   belt:std({color:0x050506,roughness:.5,metalness:.3}),
-  shoe:std({color:0xf4f4f4,emissive:0x2e2e2e,roughness:.5}),
-  sole:std({color:0xe4e4e4,emissive:0x262626,roughness:.8}),
+  shoe:std({color:0xf4f4f4,emissive:0x2e2e2e,roughness:.42}),
+  sole:std({color:0xe4e4e4,emissive:0x262626,roughness:.7}),
   lace:std({color:0xff2a1f,emissive:0xff2a1f,roughness:.8}),
   cord:std({color:0x2a2a30,roughness:.9}),
-  zip:std({color:0x3a3a42,roughness:.4,metalness:.7})
+  zip:std({color:0x3a3a42,roughness:.3,metalness:.8}),
+  tip:std({color:0x1a1a1e,roughness:.45})
 };
 function mk(geo,mat,x,y,z,sx,sy,sz){
   const m=new THREE.Mesh(geo,mat);
@@ -1388,8 +1627,8 @@ function mk(geo,mat,x,y,z,sx,sy,sz){
   if(sx!==undefined)m.scale.set(sx,sy,sz);
   m.castShadow=true;m.receiveShadow=true;return m;
 }
-const SPH=(r)=>new THREE.SphereGeometry(r,24,16);
-const CYL=(rt,rb,h,s)=>new THREE.CylinderGeometry(rt,rb,h,s||16);
+const SPH=(r)=>new THREE.SphereGeometry(r,32,22);
+const CYL=(rt,rb,h,s)=>new THREE.CylinderGeometry(rt,rb,h,Math.max(s||16,24));
 function J(parent,x,y,z){const o=new THREE.Object3D();o.position.set(x,y,z);parent.add(o);return o}
 
 function buildCharacter(){
@@ -1410,8 +1649,14 @@ function buildCharacter(){
   for(const sx of [-1,1]){const cord=mk(CYL(.006,.006,.14,6),CM.cord,sx*.03,.4,.108);spine.add(cord);cords.push(cord)}
   const hoodRing=mk(new THREE.TorusGeometry(.082,.034,10,24),CM.hood,0,.5,-.01);hoodRing.rotation.x=Math.PI/2;hoodRing.scale.set(1.25,1,1);spine.add(hoodRing);
   const hoodBack=mk(SPH(.1),CM.hood,0,.46,-.09,1.15,.8,.7);spine.add(hoodBack);
+  const hem=mk(CYL(.15,.145,.05,32),CM.hoodDark,0,-.035,0,1.18,1,.64);spine.add(hem);
+  const pocket=mk(new THREE.BoxGeometry(.19,.1,.012),CM.hood,0,.075,.109);spine.add(pocket);
+  const pockL=mk(new THREE.BoxGeometry(.008,.1,.016),CM.hoodDark,-.1,.075,.106);pockL.rotation.z=.25;spine.add(pockL);
+  const pockR=mk(new THREE.BoxGeometry(.008,.1,.016),CM.hoodDark,.1,.075,.106);pockR.rotation.z=-.25;spine.add(pockR);
+  const collar=mk(new THREE.TorusGeometry(.07,.016,10,28),CM.hoodDark,0,.52,.012);collar.rotation.x=Math.PI/2;collar.scale.set(1.3,1.1,.9);spine.add(collar);
+  const pull=mk(new THREE.BoxGeometry(.014,.03,.008),CM.zip,0,.435,.112);spine.add(pull);
   jt.fpHeadParts=[hoodRing,hoodBack];
-  jt.fpTorsoParts=[torso,bib,zip,...cords];
+  jt.fpTorsoParts=[torso,bib,zip,hem,pocket,pockL,pockR,collar,pull,...cords];
   jt.fpLowerParts=pelvisParts;
   /* neck & head */
   neck.add(mk(CYL(.046,.052,.13,14),CM.skin,0,.035,.004));
@@ -1464,6 +1709,10 @@ function buildCharacter(){
     an.add(mk(SPH(1),CM.shoe,0,-.05,.13,.056,.04,.062));
     an.add(mk(new THREE.BoxGeometry(.112,.03,.27),CM.sole,0,-.068,.055));
     an.add(mk(SPH(1),CM.sole,0,-.068,.19,.056,.015,.03));
+    an.add(mk(SPH(1),CM.tip,0,-.052,.165,.05,.03,.04));
+    an.add(mk(SPH(1),CM.shoe,0,-.02,-.02,.056,.06,.05));
+    an.add(mk(new THREE.BoxGeometry(.05,.012,.07),CM.sole,0,.006,.07));
+    an.add(mk(new THREE.BoxGeometry(.114,.012,.275),CM.lace,0,-.054,.055));
     for(let i=0;i<3;i++)an.add(mk(new THREE.BoxGeometry(.05,.006,.012),CM.lace,0,-.0+(-0.004),.045+i*.03));
     an.children[an.children.length-1].position.y=.018;
     return [hp,kn,an];
@@ -1772,6 +2021,7 @@ function makeMocap(jt,anim){
       rPh=(rPh+dt*rate/dur)%1;
       return {n:'run',t:rPh*dur,w:1};
     }
+    if(st==='dead')return {n:'fall',t:cT,w:1};   /* falling into the void: same falling clip, full weight, no tumbling */
     if(st==='air')return {n:'fall',t:cT,w:smooth((-c.vy+.5)/5.5)};
     if(st==='ground'&&c.cr){
       if(c.cr===1)return {n:'crIn',t:Math.min(c.crT,.63),w:1};
@@ -2816,6 +3066,7 @@ let mode='menu';               // menu | play | paused | dead
 let firstPerson=false;
 let camYaw=0,camPitch=-.2,camPos=new THREE.Vector3(),camInit=false;
 let jumpBuf=0,slideBuf=0,deadT=0,menuT=0,best=0;
+let deadCamSet=false;const deadProj=new THREE.Vector3();
 try{best=parseInt(localStorage.getItem('voidrunner.best')||'0',10)||0}catch(e){}
 
 const P={};
@@ -2826,7 +3077,7 @@ const TRAINING_LESSONS=[
   {title:'Jump over an obstacle',copy:'Approach the low barrier and press Space to jump over it. Keep moving forward until you clear it.'},
   {title:'Steer in the air',copy:'Jump across the gap. Keep D held while airborne to steer right and land on the offset platform.'},
   {title:'Slide under the beam',copy:'Hold Shift to build speed, then press C just before the low beam. Stay low until you pass underneath.'},
-  {title:'Climb a high wall',copy:'Run directly at the tall wall and hold Space as you reach it. Keep moving forward while the climb animation pulls you up.'},
+  {title:'Climb a high wall',copy:'Run directly at the tall wall and hold Space as you reach it. Keep moving forward while the climb animation pulls you up. In the tower area, press Space again during the climb to leap in the direction you are looking.'},
   {title:'Wall run & wall jump',copy:'Move toward the right-side wall. Jump while holding W + D to contact it, then press Space again while wall-running to kick away.'},
   {title:'Rope swing',copy:'Run to the edge and jump toward the hanging rope. Hold W to pump the swing; press Space with a direction held to release and land on the lower platform.'}
 ];
@@ -2852,8 +3103,152 @@ function resetPlayer(){
     landPulse:0});
 }
 let anchorZ=6;
+/* ================= THE VOID: a black hole with a red rim that chases the runner and swallows the ground behind ================= */
+const HOLE_R=34,HOLE_ZONE=34,HOLE_EAT=17;
+const hole={on:false,x:0,y:0,z:0,gap:48,warned:false,t:0};
+const holeG=new THREE.Group();holeG.visible=false;scene.add(holeG);
+(function buildHole(){
+  const disc=new THREE.Mesh(new THREE.CircleGeometry(HOLE_R,80),new THREE.MeshBasicMaterial({color:0x000000,side:THREE.DoubleSide,fog:false}));
+  disc.renderOrder=1;holeG.add(disc);
+  const accTex=ctex(512,512,(g,w,h)=>{
+    g.clearRect(0,0,w,h);
+    const c=w/2,r0=.53,gr=g.createRadialGradient(c,c,c*r0,c,c,c);
+    gr.addColorStop(0,'rgba(255,120,90,1)');gr.addColorStop(.12,'rgba(255,48,36,.9)');gr.addColorStop(.45,'rgba(179,24,28,.45)');gr.addColorStop(1,'rgba(179,24,28,0)');
+    g.fillStyle=gr;g.fillRect(0,0,w,h);
+    g.globalCompositeOperation='destination-out';
+    for(let i=0;i<70;i++){
+      const a=rand(0,6.28),r=rand(c*r0,c*.98),len=rand(.25,.9);
+      g.strokeStyle='rgba(0,0,0,'+rand(.15,.5).toFixed(2)+')';g.lineWidth=rand(1,5);
+      g.beginPath();g.arc(c,c,r,a,a+len);g.stroke();
+    }
+  },{clamp:true});
+  const mat=new THREE.MeshBasicMaterial({map:accTex,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,side:THREE.DoubleSide,fog:false});
+  const ring=new THREE.Mesh(new THREE.RingGeometry(HOLE_R*.9,HOLE_R*1.7,96,1),mat);ring.position.z=-.1;ring.renderOrder=2;holeG.add(ring);
+  const ring2=new THREE.Mesh(new THREE.RingGeometry(HOLE_R*.97,HOLE_R*1.35,96,1),mat);ring2.position.z=-.2;ring2.renderOrder=2;holeG.add(ring2);
+  const rim=new THREE.Mesh(new THREE.RingGeometry(HOLE_R*.985,HOLE_R*1.012,96,1),new THREE.MeshBasicMaterial({color:0xff4a3c,side:THREE.DoubleSide,fog:false}));
+  rim.position.z=-.15;rim.renderOrder=3;holeG.add(rim);
+  const haloTex=ctex(256,256,(g,w,h)=>{
+    const gr=g.createRadialGradient(w/2,h/2,w*.18,w/2,h/2,w/2);
+    gr.addColorStop(0,'rgba(255,50,40,.5)');gr.addColorStop(.5,'rgba(179,24,28,.2)');gr.addColorStop(1,'rgba(179,24,28,0)');
+    g.fillStyle=gr;g.fillRect(0,0,w,h);
+  },{clamp:true});
+  const halo=new THREE.Mesh(new THREE.PlaneGeometry(HOLE_R*6,HOLE_R*6),new THREE.MeshBasicMaterial({map:haloTex,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,fog:false,side:THREE.DoubleSide}));
+  halo.position.z=-.3;halo.renderOrder=1;holeG.add(halo);
+  holeG.userData={ring,ring2};
+  /* swirling debris being dragged in */
+  const N=420,pos=new Float32Array(N*3),pr=[],pa=[],pz=[];
+  for(let i=0;i<N;i++){pr.push(rand(HOLE_R*1.0,HOLE_R*2.6));pa.push(rand(0,6.28));pz.push(rand(-4,0))}
+  const pg=new THREE.BufferGeometry();pg.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  const pts=new THREE.Points(pg,new THREE.PointsMaterial({color:0xff5a4a,size:1.1,transparent:true,opacity:.9,blending:THREE.AdditiveBlending,depthWrite:false,fog:false}));
+  pts.frustumCulled=false;pts.renderOrder=3;holeG.add(pts);
+  holeG.userData.pts={pts,pos,pr,pa,pz,N};
+  const lt=new THREE.PointLight(0xff2a1f,2.4,95,1.4);lt.position.z=-14;holeG.add(lt);
+})();
+const holeUI=document.createElement('div');
+holeUI.style.cssText='position:fixed;inset:0;pointer-events:none;z-index:4;opacity:0;background:radial-gradient(ellipse at 50% 55%,rgba(0,0,0,0) 42%,rgba(150,10,20,.5) 78%,rgba(0,0,0,.92) 100%)';
+document.body.appendChild(holeUI);
+const holePulse=document.createElement('div');
+holePulse.style.cssText='position:fixed;inset:0;pointer-events:none;z-index:4;opacity:0;background:radial-gradient(ellipse at 50% 50%,rgba(0,0,0,0) 38%,rgba(210,0,25,.55) 72%,rgba(255,10,30,.95) 100%)';
+document.body.appendChild(holePulse);
+let heartT=0,heartPulse=0,heartDub=0;
+const holeTag=document.createElement('div');
+holeTag.style.cssText='position:fixed;left:50%;top:calc(64px + env(safe-area-inset-top,0px));transform:translateX(-50%);z-index:5;pointer-events:none;font:600 13px var(--mono);letter-spacing:.14em;color:#ff5a4d;text-shadow:0 0 12px rgba(255,40,30,.8);opacity:0;transition:opacity .2s;white-space:nowrap';
+document.body.appendChild(holeTag);
+function holeRebuildLists(){
+  solids=[];walls=[];pads=[];ropes=[];
+  for(const ch of chunks){
+    for(const s of ch.solids)if(!s.eaten){solids.push(s);if(s.wall)walls.push(s)}
+    for(const p of ch.pads)if(!p.eaten)pads.push(p);
+    for(const r of ch.ropes)if(!r.eaten)ropes.push(r);
+  }
+}
+function holeReset(){
+  hole.on=true;hole.x=P.x;hole.y=P.y;hole.z=P.z+48;hole.gap=48;hole.warned=false;hole.t=0;
+}
+function holeUpdate(dt){
+  if(!hole.on||P.state==='dead')return;
+  hole.t+=dt;
+  const dist=P.maxDist;
+  let v=4.0+4.6*(1-Math.exp(-dist/900));
+  v*=clamp(hole.t/4,.35,1);                                   /* gentle start */
+  const g0=hole.z-P.z;
+  if(g0>75)v*=1+Math.min(1.2,(g0-75)/40);                      /* catches up if the runner pulls far ahead */
+  hole.z-=v*dt;
+  if(hole.z-P.z>125)hole.z=P.z+125;
+  hole.x+=(P.x-hole.x)*Math.min(1,dt*1.4);
+  hole.y+=((P.y-1)-hole.y)*Math.min(1,dt*1.1);
+  const gap=hole.z-P.z;hole.gap=gap;
+  /* swallow terrain */
+  let changed=false;
+  const eatZ=hole.z-HOLE_EAT,farZ=hole.z-HOLE_ZONE;
+  for(const ch of chunks){
+    if(ch.done||ch.z1<farZ)continue;
+    if(ch.z0>hole.z+6){
+      for(const m of ch.meshes)m.visible=false;
+      for(const s of ch.solids)if(!s.eaten){s.eaten=true;changed=true}
+      for(const p of ch.pads)p.eaten=true;
+      for(const r of ch.ropes)r.eaten=true;
+      ch.done=true;changed=true;continue;
+    }
+    for(const s of ch.solids)if(!s.eaten&&(s.z0+s.z1)/2>eatZ){s.eaten=true;changed=true}
+    for(const p of ch.pads)if(!p.eaten&&(p.z0+p.z1)/2>eatZ){p.eaten=true;changed=true}
+    for(const r of ch.ropes)if(!r.eaten&&r.z>eatZ){r.eaten=true;changed=true}
+    for(const m of ch.meshes){
+      if(m.parent!==worldGroup)continue;
+      let o=m.userData.o;
+      if(!o){
+        if(m.position.z<farZ)continue;
+        o=m.userData.o={px:m.position.x,py:m.position.y,pz:m.position.z,sx:m.scale.x,sy:m.scale.y,sz:m.scale.z,rz:m.rotation.z};
+      }
+      const f=clamp((o.pz-farZ)/HOLE_ZONE,0,1),fe=f*f*(3-2*f);
+      if(f>=.999&&o.pz>hole.z+2){m.visible=false;continue}
+      const ang=fe*2.8,ca=Math.cos(ang),sa=Math.sin(ang),k=1-fe*.97;
+      const dx=o.px-hole.x,dy=o.py-hole.y;
+      m.position.set(hole.x+(dx*ca-dy*sa)*k,hole.y+(dx*sa+dy*ca)*k,o.pz+((hole.z-2)-o.pz)*fe*.9);
+      m.scale.set(o.sx*k,o.sy*k,o.sz*k);
+      m.rotation.z=o.rz+ang;
+    }
+  }
+  if(changed)holeRebuildLists();
+  /* suction on the runner */
+  const pullF=Math.pow(clamp(1-gap/HOLE_ZONE,0,1),2);
+  if(pullF>0&&P.state!=='rope')P.z+=pullF*3.5*dt;
+  if(pullF>0)fxSpike=Math.max(fxSpike,pullF*.7);
+  if(gap<26&&!hole.warned){hole.warned=true;toast('The void is close!',0)}
+  if(gap>40)hole.warned=false;
+  if(gap<2.6&&P.state!=='dead'){die();toast('Swallowed by the void',0)}
+}
+function holeVisuals(dt){
+  const show=hole.on&&!trainingMode&&(mode==='play'||mode==='dead'||mode==='paused');
+  holeG.visible=show;
+  const near=show?clamp(1-hole.gap/50,0,1):0;
+  holeUI.style.opacity=(near*.9).toFixed(3);
+  holeTag.style.opacity=show&&mode==='play'?1:0;
+  /* heartbeat: gets faster and stronger as the void closes in; every beat flashes red around the screen edges */
+  const hn=show&&mode==='play'&&P.state!=='dead'?clamp(1-hole.gap/42,0,1):0;
+  if(hn>.05){
+    heartT+=dt*(62+98*hn)/60;
+    if(heartT>=1){heartT-=1;heartPulse=1;heartDub=.17*(1-.3*hn);try{sfx.heart(hn)}catch(e){}}
+  }else heartT=.9;
+  if(heartDub>0){heartDub-=dt;if(heartDub<=0)heartPulse=Math.max(heartPulse,.75)}
+  heartPulse*=Math.exp(-dt*6.5);
+  holePulse.style.opacity=(heartPulse*(.35+.65*hn)).toFixed(3);
+  if(!show)return;
+  holeG.position.set(hole.x,hole.y+HOLE_R*.35,hole.z);
+  const u=holeG.userData;
+  u.ring.rotation.z+=dt*.45;u.ring2.rotation.z-=dt*.8;
+  const q=u.pts,a=q.pos;
+  for(let i=0;i<q.N;i++){
+    q.pr[i]-=dt*(3+HOLE_R*.9/q.pr[i]*6);q.pa[i]+=dt*(.4+14/q.pr[i]);
+    if(q.pr[i]<HOLE_R*.95){q.pr[i]=rand(HOLE_R*2,HOLE_R*2.7);q.pa[i]=rand(0,6.28)}
+    a[i*3]=Math.cos(q.pa[i])*q.pr[i];a[i*3+1]=Math.sin(q.pa[i])*q.pr[i];a[i*3+2]=-q.pz[i]*.5-.4;
+  }
+  q.pts.geometry.attributes.position.needsUpdate=true;
+  holeTag.textContent='THE VOID  '+Math.max(0,Math.round(hole.gap))+' m';
+  holeTag.style.color=hole.gap<26?'#ff2a1f':'#ff7a6a';
+}
 function resetGame(){
-  resetPlayer();resetWorld();generate(P.z,0);
+  resetPlayer();resetWorld();generate(P.z,0);holeReset();
   camYaw=0;camPitch=-.2;camInit=false;deadT=0;
   $('toasts').innerHTML='';
 }
@@ -2997,8 +3392,8 @@ function showMainMenu(){
   $('final').hidden=true;$('ovtext').hidden=false;
   $('ovtext').textContent='White platforms hang over a red void that never ends. Chain jumps, wall runs, rolls and bounce pads to build speed. Fall and your run is over.';
   $('ovgrid').hidden=false;$('go').hidden=false;$('go').textContent='Run';
-  $('trainingBtn').hidden=false;$('settingsBtn').hidden=true;$('pick').hidden=false;
-  $('settingsPanel').hidden=true;$('ovnote').hidden=false;
+  $('trainingBtn').hidden=false;$('settingsBtn').hidden=false;$('pick').hidden=false;
+  $('settingsPanel').hidden=true;$('ovnote').hidden=false;ovCtx={kind:'menu'};
   $('ovnote').textContent='Computer controls: WASD move · Shift sprint · Space jump · C slide · Esc pause. Choose Training to practise each move.';
 }
 function exitTraining(){
@@ -3134,7 +3529,7 @@ function climbFace(s,hx,hz){
 function startClimb(s,top,hx,hz){
   const fromWallUp=P.state==='wallup';
   if(top-P.y>H_STAND&&!P.wallAnimOn){P.wallAnimOn=true;P.wallAnimT=0}
-  P.cr=0;P.fu=false;
+  P.cr=0;P.fu=false;if(!fromWallUp)P.cjArm=false;
   const d=moveDir(hx!==undefined?hx:P.vx,hz!==undefined?hz:P.vz);
   const F=climbFace(s,d.dx,d.dz);
   const dx=F.dx,dz=F.dz;
@@ -3154,7 +3549,7 @@ function wallYg(){return P.top+wallClimbAnim.hipsRel(wallClimbAnim.PG).y-wallPel
 function startWallUp(hit,top,dx,dz){
   P.wy0=P.y;
   if(top-P.y>H_STAND&&!P.wallAnimOn){P.wallAnimOn=true;P.wallAnimT=0;P.wallAnimSpan=1.5}
-  P.cr=0;P.state='wallup';P.wut=0;P.solid=hit;P.top=top;P.wuUsed=true;
+  P.cr=0;P.state='wallup';P.wut=0;P.solid=hit;P.top=top;P.wuUsed=true;P.cjArm=false;
   const F=climbFace(hit,dx,dz);
   P.dx=F.dx;P.dz=F.dz;P.fc=F.c;
   const reach=P.wallAnimOn?wallClimbAnim.contactReach():.3;
@@ -3328,7 +3723,7 @@ function stepPlayer(dt){
   const st=P.state;
 
   if(st==='dead'){
-    P.vy-=GRAV*dt;P.y+=P.vy*dt;P.x+=P.vx*dt;P.z+=P.vz*dt;
+    P.vy-=GRAV*2.2*dt;P.y+=P.vy*dt;P.x+=P.vx*dt;P.z+=P.vz*dt;   /* falls into the void fast */
     P.vx*=1-.8*dt;P.vz*=1-.8*dt;
     P.rollAngle+=dt*7;return;
   }
@@ -3367,6 +3762,25 @@ function stepPlayer(dt){
       else{P.state='air';P.grounded=false;P.airT=0;P.vy=-1}
     }
     return;
+  }
+  /* second jump during the wall climb (tower walls only): leap towards the direction the player is looking (camera), never into the wall */
+  if((st==='wallup'||st==='climb')&&P.wallAnimOn&&P.solid&&P.solid.tower){
+    if(!keys.Space&&!P.cjArm){P.cjArm=true;jumpBuf=0}      /* needs a fresh Space press, not the one that started the climb */
+    if(P.cjArm&&jumpBuf>0){
+      let fx=-Math.sin(camYaw),fz=-Math.cos(camYaw);
+      const nx=P.dx||0,nz=P.dz||0,into=fx*nx+fz*nz;          /* (nx,nz) = unit direction into the wall */
+      if(into>0){fx-=nx*into;fz-=nz*into}                     /* looking at the wall: slide along it instead */
+      fx-=nx*.25;fz-=nz*.25;                                  /* tiny push off so the body clears the wall face */
+      const l=Math.hypot(fx,fz)||1;fx/=l;fz/=l;
+      const sp=6;
+      P.vx=fx*sp;P.vz=fz*sp;P.vy=9;
+      P.yaw=Math.atan2(-fx,-fz);P.dx=fx;P.dz=fz;
+      P.state='air';P.grounded=false;P.airT=0;P.coyote=0;P.jumpHeld=true;jumpBuf=0;
+      P.fromWall=true;P.wallBlock=.35;P.wuUsed=false;P.noGrab=P.solid;P.wallAnimOn=false;P.fu=false;P.solid=null;P.onRamp=false;   /* wuUsed=false: another tall wall can be climbed; the wall just left can't be re-grabbed */
+      toast('Wall leap',10);
+      puff(P.x,P.y+.05,P.z,4,0xd8c9b8,1.6,.4,.4);
+      return;
+    }
   }
   if(st==='climb'&&P.fu&&P.wallAnimOn&&wallClimbAnim.ready){
     P.u=P.t/P.dur;const u=clamp(P.u,0,1);
@@ -3507,7 +3921,7 @@ function stepPlayer(dt){
   /* ---------- horizontal move with collision ---------- */
   let hit=null,hitZ=false,hitX=false;
   const pvx=P.vx,pvz=P.vz;
-  if(P.state==='ground')P.wuUsed=false;
+  if(P.state==='ground'){P.wuUsed=false;P.noGrab=null}
   const nx=P.x+P.vx*dt;
   const bx=blocked(nx,P.z,P.y,h);
   if(!bx)P.x=nx;
@@ -3524,12 +3938,12 @@ function stepPlayer(dt){
     const top=topOf(hit,clamp(P.x,hit.x0,hit.x1),clamp(P.z,hit.z0,hit.z1));
     const rel=top-P.y;
     if(hit.y0<=P.y+.45){
-      if(P.state==='ground'&&rel>STEP&&rel<=1.35&&hs>=3.2&&inp.fz>0)startVault(hit,top,pvx,pvz);
+      if(P.state==='ground'&&rel>STEP&&rel<=1.35&&hs>=3.2&&inp.fz>0&&(keys.Space||jumpBuf>0))startVault(hit,top,pvx,pvz);   /* only when the player presses jump */
       else if(P.state==='air'&&rel>.25&&rel<=1.45&&P.vy<4.5)startClimb(hit,top,pvx,pvz);
       else if(P.state==='ground'&&rel>1.35&&rel<=2.45&&keys.Space&&hs>2.5)startClimb(hit,top,pvx,pvz);
     }
   }
-  if(hit&&!hit.small&&!hit.ramp&&moving&&inp.fz>0&&!P.wuUsed&&(P.state==='air'||P.state==='ground')&&hit.y0<=P.y+.45){
+  if(hit&&!hit.small&&!hit.ramp&&moving&&inp.fz>0&&!P.wuUsed&&hit!==P.noGrab&&(P.state==='air'||P.state==='ground')&&hit.y0<=P.y+.45){
     const top=topOf(hit,clamp(P.x,hit.x0,hit.x1),clamp(P.z,hit.z0,hit.z1)),rel=top-P.y;
     const useX=hitX&&(!hitZ||Math.abs(pvx)>=Math.abs(pvz));
     const ps=useX?Math.abs(pvx):Math.abs(pvz);
@@ -3759,6 +4173,15 @@ function updateCamera(dt){
     if(P.state==='roll'||P.state==='slide'){/* body drives eye height via head */}
     return;
   }
+  if(P.state==='dead'){
+    /* falling into the void: the camera hangs above the player (slightly behind) and stays there, looking down at him shrinking away */
+    if(deadCamSet)return;
+    tmpV.set(P.x,P.y+1,P.z);
+    tmpV2.set(P.x+Math.sin(camYaw)*1.2,P.y+8,P.z+Math.cos(camYaw)*1.2);
+    camera.position.copy(cameraClearPosition(tmpV,tmpV2));
+    camera.lookAt(P.x,P.y,P.z);
+    deadCamSet=true;return;
+  }
   const dist=(P.state==='slide'?2.7:P.state==='rope'?4.3:3.1)+clamp((sp-6)*.1,0,.4);
   const cy=Math.cos(camPitch),sy=Math.sin(camPitch);
   const fx=-Math.sin(camYaw)*cy,fy=sy,fz=-Math.cos(camYaw)*cy;
@@ -3770,7 +4193,7 @@ function updateCamera(dt){
   camPos.lerp(tmpV2,k);
   camera.position.copy(cameraClearPosition(tmpV,camPos));
   camera.rotation.set(camPitch,camYaw,0,'YXZ');
-  if(P.state==='dead'){camera.lookAt(P.x,Math.max(P.y,P.baseY-6),P.z)}
+  if(P.state==='dead'){camera.lookAt(P.x,P.y+1,P.z);deadCamSet=true}
   else camera.rotation.z=P.state==='wall'?-P.wallSign*.05:0;
   applyLandingCamera(dt);
 }
@@ -3895,17 +4318,48 @@ function updateHud(){
 
 /* ---------- overlay ---------- */
 const ov=$('ov');
-function showOverlay(kind,score){
+/* game-over card drop-in + landing dust (pure CSS/DOM, independent of the stopped render loop) */
+const ovCard=ov.querySelector('.card');
+const dustBox=document.createElement('div');dustBox.className='dust';ov.appendChild(dustBox);
+let dustTimer=0;
+function stopDropIn(){clearTimeout(dustTimer);dustBox.textContent='';ovCard.classList.remove('drop')}
+function playDropIn(){
+  stopDropIn();
+  if(window.matchMedia&&matchMedia('(prefers-reduced-motion:reduce)').matches)return;
+  void ovCard.offsetWidth;ovCard.classList.add('drop');
+  dustTimer=setTimeout(()=>{      /* the card touches down at 58% of the 0.9 s animation */
+    sfx.heavyImpact();
+    const r=ovCard.getBoundingClientRect(),n=22;
+    for(let i=0;i<n;i++){
+      const t=i/(n-1),side=t<.5?-1:1;
+      const e=document.createElement('div');e.className='puff';
+      const size=60+Math.random()*90;
+      /* spread along the bottom edge, thicker at the corners; drift outwards and upwards */
+      const x=r.left+r.width*(i%3===0?(side<0?Math.random()*.12:1-Math.random()*.12):t);
+      const y=r.bottom-8+Math.random()*10;
+      e.style.cssText='left:'+x+'px;top:'+y+'px;width:'+size+'px;height:'+size+'px;'+
+        '--dx:'+(side*(30+Math.random()*150)*(Math.abs(t-.5)*1.6+.4))+'px;--dy:'+(-(15+Math.random()*80))+'px;'+
+        '--s:'+(2+Math.random()*1.8)+';--t:'+(.9+Math.random()*.7)+'s;animation-delay:'+(Math.random()*.06)+'s';
+      dustBox.appendChild(e);
+    }
+    dustTimer=setTimeout(()=>{dustBox.textContent=''},1900);
+  },520);
+}
+let ovCtx={kind:'menu'};   /* which menu is on screen, so Settings can return to it */
+function showOverlay(kind,score,quiet){
+  stopDropIn();
+  ovCtx={kind,score};
   ov.hidden=false;
   const title=$('ovtitle'),text=$('ovtext'),go=$('go'),fin=$('final'),grid=$('ovgrid'),note=$('ovnote');
   const settingsBtn=$('settingsBtn'),settingsPanel=$('settingsPanel'),pickBtn=$('pick');
-  settingsPanel.hidden=true;settingsBtn.hidden=true;go.hidden=false;pickBtn.hidden=false;text.hidden=false;note.hidden=false;
+  settingsPanel.hidden=true;settingsBtn.hidden=false;go.hidden=false;pickBtn.hidden=false;text.hidden=false;note.hidden=false;
   $('trainingBtn').hidden=true;$('trainingMenuActions').hidden=true;
   if(kind==='dead'){
     title.innerHTML='Run <span>over</span>';
     fin.hidden=false;fin.textContent=score.toLocaleString();
     text.textContent='Fall counted as a loss. '+(score>=best&&score>0?'New best. ':'Best: '+best.toLocaleString()+'. ')+'The void keeps what it catches.';
     grid.hidden=true;go.textContent='Run again';note.textContent='Press R or Enter to restart.';
+    if(!quiet)playDropIn();
   }else if(kind==='paused'){
     title.innerHTML='Pau<span>sed</span>';fin.hidden=true;text.textContent='Take a breath. The roofs will wait.';
     grid.hidden=true;go.textContent='Resume';note.textContent='Press Esc to resume.';settingsBtn.hidden=false;pickBtn.hidden=true;
@@ -3915,18 +4369,18 @@ function showOverlay(kind,score){
     title.innerHTML='Training <span>complete</span>';fin.hidden=false;fin.textContent=score+'/'+TRAINING_LESSONS.length;
     text.textContent='You completed the core movement course. Replay the full practice course or return to the main menu and start an endless run.';
     grid.hidden=true;go.textContent='Train again';pickBtn.hidden=true;note.textContent='All lessons completed.';
-    $('trainingMenuActions').hidden=false;$('trainingRestartBtn').hidden=true;$('trainingExitBtn').textContent='Exit to main menu';settingsBtn.hidden=true;
+    $('trainingMenuActions').hidden=false;$('trainingRestartBtn').hidden=true;$('trainingExitBtn').textContent='Exit to main menu';
   }
 }
 function openPauseSettings(){
-  if(mode!=='paused')return;
   $('settingsPanel').hidden=false;
   $('ovtitle').innerHTML='Game <span>settings</span>';
-  $('final').hidden=true;$('ovtext').textContent='Adjust mouse sensitivity and balance music against gameplay sounds.';
-  $('ovgrid').hidden=true;$('go').hidden=true;$('settingsBtn').hidden=true;$('pick').hidden=true;$('ovnote').hidden=true;$('trainingMenuActions').hidden=true;
+  $('final').hidden=true;$('ovtext').textContent='Adjust mouse sensitivity and balance music against gameplay sounds.';$('final').hidden=true;$('ovnote').hidden=true;
+  $('ovgrid').hidden=true;$('go').hidden=true;$('settingsBtn').hidden=true;$('trainingBtn').hidden=true;$('pick').hidden=true;$('ovnote').hidden=true;$('trainingMenuActions').hidden=true;
   syncPauseSettings();
 }
 function begin(){
+  ensureLoop();
   trainingMode=false;$('trainingHud').hidden=true;$('trainingMenuActions').hidden=true;
   if(mode==='dead'||mode==='menu'){
     resetGame();anchorZ=P.z;
@@ -3937,7 +4391,7 @@ function begin(){
 function die(){
   P.falls++;fxSpike=1.4;
   P.state='dead';P.grounded=false;P.rope=null;P.ropeReach=false;P.cr=0;P.onRamp=false;
-  P.wallAnimOn=false;P.stable=0;deadT=0;camInit=false;
+  P.wallAnimOn=false;P.stable=0;deadT=0;camInit=false;deadCamSet=false;P.vy=Math.min(P.vy,-14);
   toast('Run over',0);
 }
 $('go').addEventListener('click',()=>{
@@ -3954,7 +4408,11 @@ $('trainingRestartBtn').addEventListener('click',()=>{
 });
 $('trainingExitBtn').addEventListener('click',exitTraining);
 $('settingsBtn').addEventListener('click',openPauseSettings);
-$('settingsBack').addEventListener('click',()=>{if(mode==='paused')showOverlay('paused')});
+$('settingsBack').addEventListener('click',()=>{
+  /* back to whichever menu opened Settings (dead: no drop animation / sound again) */
+  const c=ovCtx;
+  if(c.kind==='menu')showMainMenu();else showOverlay(c.kind,c.score,true);
+});
 
 /* ---------- input ---------- */
 window.addEventListener('keydown',e=>{
@@ -3975,8 +4433,8 @@ window.addEventListener('keydown',e=>{
   }
   if(e.code==='KeyV'){setView(!firstPerson);if(P.state==='dead'){headGroup.visible=true;neckGroup.visible=true}}
   if(e.code==='KeyR'&&mode==='play'&&trainingMode){respawnTrainingCheckpoint(true);return}
-  if(e.code==='KeyR'&&(mode==='play'||mode==='dead')){mode='dead';begin()}
-  if((e.code==='Enter'||e.code==='Space')&&(mode==='menu'||mode==='dead')&&!e.repeat){begin()}
+  if(e.code==='KeyR'&&(mode==='play'||(mode==='dead'&&$('settingsPanel').hidden))){mode='dead';begin()}
+  if((e.code==='Enter'||e.code==='Space')&&(mode==='menu'||mode==='dead')&&!e.repeat&&$('settingsPanel').hidden){begin()}
   if((e.code==='Escape'||e.code==='KeyP')&&mode==='play'){mode='paused';if(trainingMode)$('trainingHud').hidden=true;showOverlay('paused');try{document.exitPointerLock()}catch(er){}}
   else if((e.code==='Escape'||e.code==='KeyP')&&mode==='paused'){mode='play';ov.hidden=true;if(trainingMode)$('trainingHud').hidden=false}
 });
@@ -4010,14 +4468,14 @@ canvas.addEventListener('touchmove',e=>{
 /* ================= SOUND EFFECTS =================
    Everything is synthesised with the Web Audio API (no audio files, so the game stays a single file).
    Tweak levels here. Press M in game to mute / unmute. */
-const SFX_VOL={master:.9,steps:.55,jump:.6,land:.6,slide:.5};
+const SFX_VOL={master:.9,steps:.55,jump:.6,land:.6,slide:.3};
 const sfx=(function(){
   let ctx=null,master,sfxGain=null,bufW,bufP,muted=false,slideG,slideBP,sfxVolume=1;
   let fallWindSource=null,fallWindHP=null,fallWindLP=null,fallWindGain=null;
   let fallWindActive=false,fallWindDuration=0,fallWindStartY=0,fallWindLevel=0;
   let musicGain=null,musicTimer=null,musicStep=0,nextMusicTime=0,musicOn=true,musicVolume=.38,appliedMusicTarget=null;
-  /* Faster, punchier parkour soundtrack: 142 BPM, with a firm four-on-the-floor pulse. */
-  const MUSIC_BPM=142, MUSIC_STEP=60/MUSIC_BPM/2;
+  /* Dark, aggressive chase soundtrack: 156 BPM, 16th-note grid, driving gallop bass, hard kick and a danger layer that rises as the void closes in. */
+  const MUSIC_BPM=148, MUSIC_STEP=60/MUSIC_BPM/4;
   try{muted=localStorage.getItem('voidrunner.mute')==='1'}catch(e){}
   try{const savedEffects=localStorage.getItem('voidrunner.effectsVolume');if(savedEffects!==null&&Number.isFinite(Number(savedEffects)))sfxVolume=clamp(Number(savedEffects),0,1)}catch(e){}
   try{
@@ -4041,11 +4499,14 @@ const sfx=(function(){
   function loop(buf,node){const s=ctx.createBufferSource();s.buffer=buf;s.loop=true;s.connect(node);s.start();return s}
   const midiHz=n=>440*Math.pow(2,(n-69)/12);
   const MUSIC_CHORDS=[
-    {notes:[69,72,76,81],bass:45},  // A minor
-    {notes:[65,69,72,77],bass:41},  // F major
-    {notes:[60,64,67,72],bass:36},  // C major
-    {notes:[67,71,74,79],bass:43}   // G major
+    {notes:[64,67,71,77],bass:40},  // E minor with a flat 9th (F) rubbing against the root
+    {notes:[60,63,66,72],bass:36},  // C diminished
+    {notes:[58,61,65,70],bass:34},  // B-flat: a tritone away from the E root
+    {notes:[65,68,72,77],bass:41}   // F minor: the half-step above E
   ];
+  const BASS_PAT=[1,0,1,1, 1,0,1,0, 1,0,1,1, 1,0,2,0];
+  const ARP_ORDER=[0,1,2,3,2,1,3,2, 0,1,2,3,3,2,1,2];
+  const dangerLevel=()=>{try{return (hole.on&&!trainingMode&&mode==='play'&&P.state!=='dead')?clamp(1-hole.gap/45,0,1):0}catch(e){return 0}};
   function musicVoice(freq,when,duration,shape,volume,opts){
     if(!ctx||!musicGain)return;
     opts=opts||{};
@@ -4066,7 +4527,7 @@ const sfx=(function(){
     if(!ctx||!musicGain)return;
     const o=ctx.createOscillator(),g=ctx.createGain();o.type='sine';
     o.frequency.setValueAtTime(148,t);o.frequency.exponentialRampToValueAtTime(42,t+.13);
-    g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.42,t+.006);g.gain.exponentialRampToValueAtTime(.0001,t+.2);
+    g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.55,t+.006);g.gain.exponentialRampToValueAtTime(.0001,t+.2);
     o.connect(g);g.connect(musicGain);o.start(t);o.stop(t+.23);
     /* Short, bright attack gives each kick a little more forward momentum. */
     musicVoice(midiHz(48),t,.045,'square',.035,{attack:.002,release:.035,filter:'highpass',cutoff:900,sustain:.12});
@@ -4093,13 +4554,62 @@ const sfx=(function(){
   }
   function musicPad(chord,t){
     const dur=60/MUSIC_BPM*4;
-    chord.notes.slice(0,3).forEach((n,i)=>musicVoice(midiHz(n-12),t,dur,'sawtooth',.022,{attack:.25,release:.35,sustain:.6,filter:'lowpass',cutoff:1250,detune:i===0?-5:(i===2?5:0)}));
-    chord.notes.slice(0,3).forEach((n,i)=>musicVoice(midiHz(n-24),t,dur,'triangle',.024,{attack:.18,release:.35,sustain:.65,filter:'lowpass',cutoff:520,detune:i===0?-2:(i===2?2:0)}));
+    chord.notes.forEach((n,i)=>{
+      musicVoice(midiHz(n-12),t,dur,'sawtooth',.02,{attack:.5,release:.5,sustain:.7,filter:'lowpass',cutoff:760,detune:(i%2?1:-1)*(14+i*3)});
+    });
+    musicVoice(midiHz(chord.bass-12),t,dur,'sawtooth',.03,{attack:.3,release:.5,sustain:.8,filter:'lowpass',cutoff:210,detune:-18});
+    musicVoice(midiHz(chord.bass-12),t,dur,'sawtooth',.03,{attack:.3,release:.5,sustain:.8,filter:'lowpass',cutoff:210,detune:18});
   }
-  function musicBass(note,t,accent){
-    const dur=accent?.22:.16;
-    musicVoice(midiHz(note),t,dur,'sawtooth',accent?.13:.095,{attack:.003,release:.09,sustain:.3,filter:'lowpass',cutoff:accent?520:340,q:1.1});
-    musicVoice(midiHz(note-12),t,dur,'sine',accent?.095:.07,{attack:.002,release:.105,sustain:.22,filter:'lowpass',cutoff:185});
+  /* a thin, wavering scream high above the track */
+  function musicWail(note,t,dur,vol){
+    if(!ctx||!musicGain)return;
+    const o=ctx.createOscillator(),lfo=ctx.createOscillator(),lg=ctx.createGain(),g=ctx.createGain(),f=ctx.createBiquadFilter();
+    o.type='triangle';o.frequency.setValueAtTime(midiHz(note),t);o.frequency.exponentialRampToValueAtTime(midiHz(note-1),t+dur);
+    lfo.frequency.value=5.5;lg.gain.value=28;lfo.connect(lg);lg.connect(o.detune);
+    f.type='bandpass';f.frequency.value=1800;f.Q.value=.8;
+    g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(vol,t+dur*.5);g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+    o.connect(f);f.connect(g);g.connect(musicGain);o.start(t);lfo.start(t);o.stop(t+dur+.05);lfo.stop(t+dur+.05);
+  }
+  /* breathing / whispering noise */
+  function musicBreath(t,dur,vol){
+    if(!ctx||!bufP||!musicGain)return;
+    const src=ctx.createBufferSource(),f=ctx.createBiquadFilter(),g=ctx.createGain();
+    src.buffer=bufP;f.type='bandpass';f.frequency.setValueAtTime(900,t);f.frequency.linearRampToValueAtTime(1700,t+dur*.5);f.frequency.linearRampToValueAtTime(700,t+dur);f.Q.value=2.2;
+    g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(vol,t+dur*.45);g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+    src.connect(f);f.connect(g);g.connect(musicGain);src.start(t,Math.random()*1.2);src.stop(t+dur+.05);
+  }
+  function musicBass(note,t,accent,dg){
+    const dur=accent?.13:.085;
+    musicVoice(midiHz(note),t,dur,'sawtooth',accent?.16:.12,{attack:.003,release:.05,sustain:.4,filter:'lowpass',cutoff:(accent?900:600)+(dg||0)*900,q:1.6});
+    musicVoice(midiHz(note),t,dur,'square',.05,{attack:.003,release:.05,sustain:.3,filter:'lowpass',cutoff:420,detune:7});
+    musicVoice(midiHz(note-12),t,dur+.03,'sine',.1,{attack:.002,release:.06,sustain:.3,filter:'lowpass',cutoff:190});
+  }
+  function musicBoom(t){
+    if(!ctx||!musicGain)return;
+    const o=ctx.createOscillator(),g=ctx.createGain();o.type='sine';
+    o.frequency.setValueAtTime(110,t);o.frequency.exponentialRampToValueAtTime(28,t+.7);
+    g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.6,t+.01);g.gain.exponentialRampToValueAtTime(.0001,t+.9);
+    o.connect(g);g.connect(musicGain);o.start(t);o.stop(t+.95);
+  }
+  function musicRiser(t,dur){
+    if(!ctx||!bufW||!musicGain)return;
+    const src=ctx.createBufferSource(),f=ctx.createBiquadFilter(),g=ctx.createGain();
+    src.buffer=bufW;f.type='bandpass';f.Q.value=1.4;
+    f.frequency.setValueAtTime(400,t);f.frequency.exponentialRampToValueAtTime(9000,t+dur);
+    g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.14,t+dur);g.gain.exponentialRampToValueAtTime(.0001,t+dur+.04);
+    src.connect(f);f.connect(g);g.connect(musicGain);src.start(t,Math.random()*1.2);src.stop(t+dur+.06);
+  }
+  function musicSiren(t,dur,vol){
+    if(!ctx||!musicGain)return;
+    const o=ctx.createOscillator(),f=ctx.createBiquadFilter(),g=ctx.createGain();
+    o.type='sawtooth';f.type='lowpass';f.frequency.value=2400;f.Q.value=2;
+    o.frequency.setValueAtTime(midiHz(70),t);o.frequency.exponentialRampToValueAtTime(midiHz(77),t+dur);   /* tritone-ish wail against the E root */
+    g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(vol,t+.03);g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+    o.connect(f);f.connect(g);g.connect(musicGain);o.start(t);o.stop(t+dur+.03);
+  }
+  function musicStab(chord,t,vol){
+    const notes=chord.notes.concat([chord.notes[0]+1]);   /* an added semitone makes every hit grind */
+    notes.forEach((n,i)=>musicVoice(midiHz(n),t,.12,'sawtooth',vol,{attack:.003,release:.07,sustain:.3,filter:'lowpass',cutoff:1300,q:1.6,detune:i%2?9:-9}));
   }
   function musicLead(note,t,accent){
     const dur=accent?.17:.115,vol=accent?.068:.048;
@@ -4110,30 +4620,32 @@ const sfx=(function(){
     if(!ctx||!musicGain||ctx.state!=='running')return;
     const horizon=ctx.currentTime+.2;
     while(nextMusicTime<horizon){
-      const step=musicStep%32,bar=Math.floor(step/8),beat=step%8,chord=MUSIC_CHORDS[bar];
-      const t=nextMusicTime;
-      if(beat===0)musicPad(chord,t);
-      /* Four-on-the-floor kick and a moving octave bassline. */
-      if(beat===0||beat===2||beat===4||beat===6){
-        musicKick(t);
-        const bassOffset=beat===4?7:(beat===6?5:0);
-        musicBass(chord.bass+bassOffset,t,beat===0||beat===4);
+      const step=musicStep%64,bar=Math.floor(step/16),sx=step%16,chord=MUSIC_CHORDS[bar],t=nextMusicTime,dg=dangerLevel();
+      if(sx===0){
+        musicPad(chord,t);
+        musicVoice(midiHz(chord.bass-12),t,MUSIC_STEP*16,'sine',.11,{attack:.05,release:.2,sustain:.9,filter:'lowpass',cutoff:170});   /* sub drone */
+        if(bar===0)musicBoom(t);
+        if(bar===3)musicRiser(t,MUSIC_STEP*16);
       }
-      if(beat===2||beat===6)musicSnare(t);
-      musicHat(t,beat%2===0||beat===2||beat===6);
-      /* Brighter arpeggio and a melodic hook give the loop more drive. */
-      const arp=[0,2,1,3,2,1,3,2][beat];
-      musicVoice(midiHz(chord.notes[arp]),t,.16,'triangle',.072,{attack:.005,release:.09,filter:'lowpass',cutoff:3000,sustain:.2});
-      const leadPattern=[0,2,1,3,2,1,3,2];
-      if(beat!==1&&beat!==5)musicLead(chord.notes[leadPattern[beat]],t,beat===0||beat===4||beat===7);
-      if(beat===3||beat===7){
-        const sparkle=chord.notes[beat===3?2:1]+12;
-        musicVoice(midiHz(sparkle),t+MUSIC_STEP*.45,.1,'sine',.035,{attack:.004,release:.07,filter:'lowpass',cutoff:3800,sustain:.12});
-      }
-      /* A brief two-hit fill at the end of each four-bar phrase. */
-      if(step===30){musicHat(t+MUSIC_STEP*.45,true);musicSnare(t+MUSIC_STEP*.52)}
-      if(step===31)musicHat(t+MUSIC_STEP*.35,true);
-      musicStep=(musicStep+1)%32;nextMusicTime+=MUSIC_STEP;
+      /* kick: four on the floor, a syncopated extra hit, and double-time when the void is close */
+      if(sx%4===0||(sx===10&&bar%2===1)||(dg>.5&&sx%4===2))musicKick(t);
+      /* snare on 2 and 4, with a roll at the end of the phrase */
+      if(sx===12||(dg>.35&&sx===4)||(bar===3&&sx>=13))musicSnare(t);
+      /* hats */
+      if(sx%4===2||(dg>.3&&sx%2===0))musicHat(t,sx%4===2);
+      else if(dg>.55||sx===15)musicHat(t,false);
+      /* gallop bass */
+      const bp=BASS_PAT[sx];if(bp)musicBass(chord.bass+(bp===2?12:0),t,sx%4===0,dg);
+      /* thin, cold arpeggio: low and muted so it reads as dread rather than cheer */
+      if(sx%2===0)musicVoice(midiHz(chord.notes[ARP_ORDER[sx]%4]),t,.11,'triangle',.034+dg*.02,{attack:.006,release:.07,filter:'lowpass',cutoff:1500+dg*1800,sustain:.2,detune:-9});
+      /* grinding stabs from the second bar on */
+      if(bar>=1&&(sx===3||sx===10))musicStab(chord,t,.03+dg*.014);
+      /* wailing screams and breathing in the gaps */
+      if(sx===0&&bar%2===1)musicWail(chord.notes[3]+24,t,MUSIC_STEP*14,.03+dg*.03);
+      if(sx===8&&bar%2===0)musicBreath(t,MUSIC_STEP*8,.03+dg*.04);
+      /* danger layer: wailing siren against the root */
+      if(dg>.12&&(sx===0||sx===8))musicSiren(t,MUSIC_STEP*7,.02+dg*.07);
+      musicStep=(musicStep+1)%64;nextMusicTime+=MUSIC_STEP;
     }
   }
   function startMusic(){
@@ -4145,13 +4657,25 @@ const sfx=(function(){
   function applyMusicGain(){
     if(!ctx||!musicGain)return;
     const stateScale=mode==='play'&&P.state!=='dead'?1:(mode==='paused'?.27:(mode==='dead'?.32:.42));
-    const target=(!muted&&musicOn)?musicVolume*stateScale:0;
+    const dz=clamp((dangerLevel()-.45)/.55,0,1);   /* the closer the void, the quieter the music, so the heartbeat takes over */
+    const target=(!muted&&musicOn)?musicVolume*stateScale*(1-.7*dz*dz*(3-2*dz)):0;
     if(appliedMusicTarget!==null&&Math.abs(target-appliedMusicTarget)<.0001)return;
     appliedMusicTarget=target;
     musicGain.gain.setTargetAtTime(target,ctx.currentTime,.22);
   }
+  /* game over: stop the music scheduler and suspend the whole audio context so nothing keeps running; wake again on restart */
+  let audioIdle=false;
+  function idleAudio(){
+    if(audioIdle)return;audioIdle=true;
+    if(musicTimer!==null){window.clearInterval(musicTimer);musicTimer=null}
+    if(ctx&&ctx.state==='running')ctx.suspend();
+  }
+  function wakeAudio(){
+    if(!audioIdle)return;audioIdle=false;
+    if(ctx){if(ctx.state==='suspended')ctx.resume();appliedMusicTarget=null;applyMusicGain();startMusic()}
+  }
   function unlock(){
-    if(ctx){if(ctx.state==='suspended')ctx.resume();return}
+    if(ctx){if(audioIdle){if(mode!=='dead')wakeAudio()}else if(ctx.state==='suspended')ctx.resume();return}
     const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
     ctx=new AC();
     master=ctx.createGain();master.gain.value=muted?0:SFX_VOL.master;
@@ -4193,11 +4717,33 @@ const sfx=(function(){
     g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(vol,t+.006);g.gain.exponentialRampToValueAtTime(.0001,t+d);
     o.connect(g);g.connect(out(pan));o.start(t);o.stop(t+d+.03);
   }
+  function heart(level){
+    if(!ctx||muted)return;
+    const v=.55+.45*level;
+    thump(80,38,.2,1.5*v,0,'sine');thump(150,58,.07,.5*v,0,'triangle');thump(300,120,.03,.18*v,0,'square');
+    setTimeout(()=>{thump(68,34,.19,1.15*v,0,'sine');thump(130,55,.06,.35*v,0,'triangle')},170*(1-.3*level));
+  }
   function stepSfx(side,k){
     const v=SFX_VOL.steps*(.35+.65*k),r=.9+Math.random()*.2,pan=side*.15;
     burst('lowpass',2600*r,500,.7,.004,.07,v*.9,false,pan);
     burst('bandpass',3600*r,1800,1.2,.002,.03,v*.22,false,pan);
     thump(120*r,55,.09,v*.8,pan);
+  }
+  /* game-over card hitting the ground: deep sub thud + sharp contact + debris crunch + rumble tail + small rebound.
+     The audio context is suspended on game over, so wake it for the hit and put it back to sleep afterwards. */
+  function heavyImpact(){
+    if(!ctx||muted)return;
+    const play=()=>{
+      thump(72,24,.6,2.4,0,'sine');
+      thump(150,46,.24,1.2,0,'triangle');
+      thump(340,95,.07,.5,0,'square');
+      burst('lowpass',1900,150,.7,.003,.38,1.2,true);
+      burst('lowpass',520,55,.9,.012,1,.9,true);
+      burst('bandpass',2800,900,1.2,.002,.08,.35);
+      setTimeout(()=>{thump(58,26,.42,.85,0,'sine');burst('lowpass',900,120,.8,.004,.2,.35,true)},105);
+      if(audioIdle)setTimeout(()=>{if(audioIdle&&ctx&&ctx.state==='running')ctx.suspend()},2400);
+    };
+    if(ctx.state==='suspended')ctx.resume().then(play).catch(()=>{});else play();
   }
   function jumpSfx(kind){
     const v=SFX_VOL.jump;
@@ -4319,8 +4865,8 @@ const sfx=(function(){
     if(ctx&&sfxGain)sfxGain.gain.setTargetAtTime(sfxVolume,ctx.currentTime,.025);
   }
   function updateMusic(){applyMusicGain()}
-  document.addEventListener('visibilitychange',()=>{if(ctx)document.hidden?ctx.suspend():ctx.resume()});
-  return {unlock,update,toggleMute,toggleMusic,setMusicVolume,setEffectsVolume,updateMusic,get musicOn(){return musicOn},get musicVolume(){return musicVolume},get effectsVolume(){return sfxVolume}};
+  document.addEventListener('visibilitychange',()=>{if(ctx)document.hidden?ctx.suspend():(audioIdle||ctx.resume())});
+  return {unlock,idleAudio,wakeAudio,heavyImpact,heart,update,toggleMute,toggleMusic,setMusicVolume,setEffectsVolume,updateMusic,get musicOn(){return musicOn},get musicVolume(){return musicVolume},get effectsVolume(){return sfxVolume}};
 })();
 function syncMusicControls(){
   const btn=$('musicToggle'),status=$('musicStatus'),glyph=$('musicGlyph'),vol=$('musicVolume');
@@ -4361,9 +4907,13 @@ $('trainingBtn').hidden=false;
 $('trainingMenuActions').hidden=true;
 
 /* ---------- main loop ---------- */
-let last=performance.now(),acc=0,tAll=0;
+let last=performance.now(),acc=0,tAll=0,loopRunning=true;
+/* game over: no more rendering and no more music (frame loop and audio are stopped until the next run starts) */
+function ensureLoop(){if(!loopRunning){loopRunning=true;last=performance.now();requestAnimationFrame(frame)}}
 function frame(now){
+  if(mode==='dead'){loopRunning=false;sfx.idleAudio();return}
   requestAnimationFrame(frame);
+  sfx.wakeAudio();
   let dt=Math.min(.05,(now-last)/1000);last=now;tAll+=dt;
   if(keys.KeyQ)camYaw+=1.9*dt;if(keys.KeyE)camYaw-=1.9*dt;
   if(keys.ArrowLeft)camYaw+=1.9*dt;if(keys.ArrowRight)camYaw-=1.9*dt;
@@ -4378,10 +4928,11 @@ function frame(now){
     if(trainingMode){
       updateTraining(dt);
     }else{
-      generate(P.z,dist);cull(P.z);
+      generate(P.z,dist);cull(P.z);holeUpdate(dt);
       if(P.state!=='dead'&&P.y<P.baseY-15)die();
       if(P.state==='dead'){
         deadT+=dt;
+        /* the menu appears 1.5 s after the fall starts */
         if(deadT>1.5){
           mode='dead';
           if(sc>best){best=sc;try{localStorage.setItem('voidrunner.best',String(best))}catch(e){}}
@@ -4392,11 +4943,13 @@ function frame(now){
     }
   }
   if(mode==='dead'){P.vy-=GRAV*dt;P.y+=P.vy*dt;P.rollAngle+=dt*5}
+  holeVisuals(dt);
   updateModel(dt);
   sfx.update(dt);
   sfx.updateMusic();
   updateGhosts(dt);
   updateCamera(dt);
+  if(P.state==='dead'&&deadT>1.2)hero.visible=false;   /* vanished into the void */
   updateSprites(dt);
   sun.position.set(P.x-14,P.y+80,P.z-22);
   sun.target.position.set(P.x,P.y,P.z);
